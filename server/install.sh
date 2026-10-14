@@ -8,6 +8,7 @@
 # no domain needed), starts everything and does Hyundai's one-time email verification.
 # Run it again later to update to the newest version:  cd /opt/ioniq6 && sudo bash install.sh
 # Redo Hyundai's email verification:                  cd /opt/ioniq6 && sudo bash install.sh login
+# Find out what's broken:                             cd /opt/ioniq6 && sudo bash install.sh doctor
 set -euo pipefail
 SELF=$(readlink -f "$0")
 
@@ -142,6 +143,71 @@ volumes:
   caddy_config:
 EOF2
 }
+
+# ------------------------------------------------------------------ doctor: find what's broken
+doctor() {
+  local dom ip code err local_ok=0 public_ok=0 fails=0
+  pass() { printf '  \033[32mOK\033[0m    %s\n' "$*"; }
+  fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fails=$((fails + 1)); }
+  dom=$(grep '^DOMAIN=' .env | cut -d= -f2-)
+  ip=$(curl -fsS -m 5 https://checkip.amazonaws.com 2>/dev/null || true)
+  say "Checking the IONIQ 6 server"
+  echo "  App's server address should be: https://${dom}"
+  echo "  This server's public IP:        ${ip:-unknown}"
+  case "$dom" in
+    *.sslip.io)
+      if [ "${ip//./-}.sslip.io" = "$dom" ]; then pass "address matches this server's IP"
+      else fail "address doesn't match this server's IP — run: sudo bash install.sh"; fi ;;
+  esac
+
+  for svc in api caddy; do
+    if [ -n "$(docker compose ps -q --status running "$svc" 2>/dev/null)" ]; then pass "$svc container running"
+    else fail "$svc container is NOT running"; fi
+  done
+  if docker compose exec -T api wget -qO- http://127.0.0.1:8080/healthz >/dev/null 2>&1; then pass "API answering inside the server"
+  else fail "API not answering"; fi
+
+  err=$(mktemp)
+  code=$(curl --noproxy "*" -sS -m 10 -o /dev/null -w "%{http_code}" --resolve "${dom}:443:127.0.0.1" "https://${dom}/healthz" 2>"$err" || true)
+  if [ "$code" = 200 ]; then local_ok=1; pass "HTTPS + certificate work on the server itself"
+  else fail "HTTPS doesn't work even on the server itself ($(head -c 160 "$err"))"; fi
+  code=$(curl -sS -m 10 -o /dev/null -w '%{http_code}' "https://${dom}/healthz" 2>"$err" || true)
+  if [ "$code" = 200 ]; then public_ok=1; pass "HTTPS reachable through the public address"
+  else fail "HTTPS NOT reachable through the public address ($(head -c 160 "$err"))"; fi
+  rm -f "$err"
+
+  local mem swap
+  mem=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+  swap=$(awk '/SwapTotal/ {print int($2/1024)}' /proc/meminfo)
+  if [ "$mem" -lt 1500 ] && [ "$swap" -eq 0 ]; then fail "${mem} MB RAM and no swap — can freeze (sudo bash install.sh adds swap)"
+  else pass "memory: ${mem} MB RAM, ${swap} MB swap"; fi
+  if journalctl -k -b -1 2>/dev/null | grep -qiE "out of memory|killed process"; then
+    echo "  note  before the last restart the server ran out of memory"
+  fi
+
+  say "What to do"
+  if [ "$fails" -eq 0 ]; then
+    echo "  Everything checks out from the server. If the phone still can't connect, open"
+    echo "  https://${dom}/healthz in the phone's browser and tell Claude what it shows."
+  elif [ "$local_ok" = 1 ] && [ "$public_ok" = 0 ]; then
+    echo "  The server works, but the outside can't reach it: the firewall is blocking HTTPS."
+    echo "  Lightsail → your instance → Networking → IPv4 firewall → + Add rule → Application: HTTPS"
+    echo "  (port 443, any IP) → Create. Also make sure HTTP (port 80) is there. Then run this check again."
+  elif [ "$local_ok" = 0 ]; then
+    echo "  The HTTPS front-end (caddy) isn't working. Its recent log:"
+    docker compose logs --tail 15 caddy 2>&1 | sed 's/^/    /'
+    echo "  If it mentions certificates/ACME, port 80 is probably blocked in the Lightsail firewall."
+    echo "  Send this whole output to Claude."
+  else
+    echo "  Send this whole output to Claude."
+  fi
+}
+
+if [ "${1:-}" = "doctor" ]; then
+  [ -f .env ] || { echo "Not installed yet."; exit 1; }
+  doctor
+  exit 0
+fi
 
 # ------------------------------------------------------------------ redo verification only
 if [ "${1:-}" = "login" ]; then
