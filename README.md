@@ -93,20 +93,26 @@ output back on by itself once the car stops charging it.
 
 ## 4 · Set up the app
 
-1. **Server**: your API address (`https://…`) and the **PHONE_TOKEN** (never the admin
-   token). Tap **Test**.
-2. **Choose car**: pick your car from the paired Bluetooth devices.
-3. **Find ESP32**: with the ESP32 powered nearby, pick `IONIQ6-PROX`.
-4. Turn on **Monitoring** and tap **Let it run in the background**.
-   On Samsung, also: Settings → Battery → Background usage limits → **Never sleeping apps** → add it.
-5. **Threshold**: put the ESP32 in its spot in the car. Walk away to where you'd want the car to
-   lock (10–15 m is a good start) and watch the live signal on the app's status line. Tap
-   **Use current signal**. Typical values are −80 to −90 dBm.
+The home screen shows the car, its state, the controls and the walk-away lock. Setup is behind the
+**settings button** (top right).
+
+1. **Settings → Server**: your server address (`https://…`) and the **phone token**. For the
+   Unlock, Climate, Charging and Find car buttons, also add the **admin token**
+   (`sudo grep ^ADMIN_TOKEN= /opt/ioniq6/.env` on the server). Tap **Save and test**.
+   Lock and walk-away lock work with the phone token alone.
+2. **Settings → Car → Car Bluetooth**: pick your car from the paired devices.
+3. **Settings → Car → Car photo**: pick a photo of your car (otherwise a generic illustration shows).
+4. **Settings → ESP32 tag → Find**: with the ESP32 powered nearby, pick it.
+5. **Settings → Background → Allow**. On Samsung, also: phone Settings → Battery → Background usage
+   limits → **Never sleeping apps** → add the app.
+6. **Settings → Walk-away distance**: put the ESP32 in its spot in the car, walk to where you'd want
+   the car to lock (10–15 m is a good start) and tap **Use current signal**.
+7. Back on the home screen, turn **Walk-away lock** on.
 
 ## 5 · Test it
 
-1. Turn **Monitoring** on, tap **Test: arm as if I just parked**, and walk away. The log shows
-   `Away: signal … dBm` and `away → HTTP 202`, and the server's notification says the car locked.
+1. **Settings → Background and testing → Test: Arm**, then walk away. The log (bottom of Settings)
+   shows `Away: signal … dBm` and `away → HTTP 202`, and ntfy says the car locked.
 2. Then for real: drive, park, switch off, walk away.
 
 On the server, auto-lock is on and set to fast mode (the defaults).

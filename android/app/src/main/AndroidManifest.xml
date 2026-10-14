@@ -18,9 +18,10 @@
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
-        android:label="IONIQ 6 auto-lock"
-        android:icon="@android:drawable/ic_lock_lock"
-        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:label="IONIQ 6"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:theme="@style/AppTheme"
         android:allowBackup="false">
 
         <activity
@@ -32,6 +33,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
 
         <service
             android:name=".ProximityService"
