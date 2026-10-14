@@ -58,11 +58,23 @@ do_login() {
   fi
 }
 
+show_details() {
+  local url token ntfy
+  url=$(grep '^PUBLIC_URL=' .env | cut -d= -f2-)
+  token=$(grep '^PHONE_TOKEN=' .env | cut -d= -f2-)
+  ntfy=$(grep '^NTFY_URL=' .env | cut -d= -f2-)
+  say "For the phone app:"
+  echo "  Server:       ${url}"
+  echo "  Phone token:  ${token}"
+  [ -n "$ntfy" ] && echo "  ntfy topic:   ${ntfy##*/}"
+}
+
 # ------------------------------------------------------------------ redo verification only
 if [ "${1:-}" = "login" ]; then
   [ -f .env ] || { echo "Not installed yet — run without 'login' first."; exit 1; }
   wait_healthy
   do_login
+  show_details
   exit 0
 fi
 
@@ -72,8 +84,13 @@ if [ -f .env ]; then
   docker compose pull
   docker compose up -d
   wait_healthy
-  say "Updated. Status:"
-  api GET /v1/auth
+  if api GET /v1/auth | grep -q '"loggedIn": false'; then
+    echo "Not signed in to BlueLink yet — finishing that now."
+    do_login
+  else
+    echo "Updated and signed in to BlueLink."
+  fi
+  show_details
   exit 0
 fi
 
