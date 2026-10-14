@@ -7,8 +7,8 @@
  * fades or the link drops, and the *phone* calls the auto-lock API. The ESP32 needs no Wi-Fi
  * and no internet.
  *
- * LED (GPIO 2): short blink every 3 s = waiting for the phone; off = phone connected.
- * Serial (115200): connection events, for debugging.
+ * Blue LED (GPIO 2): blinks every 2 s = waiting for the phone; steady on = phone connected.
+ * Serial (115200): a status line every 5 s, plus connection events.
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -21,7 +21,7 @@
 #define SERVICE_UUID "7805ea83-4cbf-4a8d-b043-9e4a07355fc4"
 #define INFO_UUID    "487e453a-6deb-4bae-8e5e-da2f321748c5"
 #define DEVICE_NAME  "IONIQ6-PROX"
-#define FW_VERSION   "1.0.0"
+#define FW_VERSION   "1.1.0"
 
 static const int LED_PIN = 2;
 
@@ -74,6 +74,7 @@ void setup() {
 
 void loop() {
   static uint32_t lastBlink = 0;
+  static uint32_t lastStatus = 0;
 
   if (restartAdvertising) {
     restartAdvertising = false;
@@ -82,11 +83,20 @@ void loop() {
     Serial.println("advertising again");
   }
 
-  if (!phoneConnected && millis() - lastBlink > 3000) {
+  if (phoneConnected) {
+    digitalWrite(LED_PIN, HIGH);                 // steady: a phone is connected
+  } else if (millis() - lastBlink > 2000) {
     lastBlink = millis();
-    digitalWrite(LED_PIN, HIGH);
-    delay(30);
+    digitalWrite(LED_PIN, HIGH);                 // clear 200 ms blink: waiting for a phone
+    delay(200);
     digitalWrite(LED_PIN, LOW);
+  }
+
+  if (millis() - lastStatus > 5000) {
+    lastStatus = millis();
+    Serial.printf("IONIQ6-PROX %s | %s | up %lus\n", FW_VERSION,
+                  phoneConnected ? "phone connected" : "advertising, waiting for phone",
+                  (unsigned long)(millis() / 1000));
   }
 
   delay(100);

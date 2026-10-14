@@ -65,7 +65,11 @@ No software to install — use Chrome or Edge on a computer:
    - Nothing shows up? Windows may need the CP210x USB driver from Silicon Labs.
    - Won't connect? Hold the board's **BOOT** button while clicking Connect.
 4. Set **Flash Address** to `0x0`, choose the `.bin` file, click **Program**.
-5. Press **EN** (reset). The blue LED now blinks briefly every 3 seconds: it's waiting for a phone.
+5. Close the flasher tab, then **unplug the ESP32 and plug it back in** (the browser can hold
+   the chip in flashing mode until it's power-cycled). The **blue** LED now blinks every
+   2 seconds: it's waiting for a phone. (The red LED is just power.) Once the app connects,
+   the blue LED stays on.
+6. Not sure? Install **nRF Connect** on the phone and scan: you should see `IONIQ6-PROX`.
 
 ## 2 · Put it in the car
 
