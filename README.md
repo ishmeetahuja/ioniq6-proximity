@@ -121,7 +121,7 @@ On the server, auto-lock is on and set to fast mode (the defaults).
 | Link drops while the signal was still strong | Treated as the ESP32 **losing power** (you started the car) — never locks by itself. If the car's Bluetooth doesn't connect within 90 s, the server checks the car and only locks if it's off. |
 | First 10 s after parking | Ignores ESP32 hiccups. |
 | ESP32 not found within 45 s of parking | Falls back to car Bluetooth only; the server uses its normal grace period. |
-| Back near the car (strong signal) for 60 s | Re-arms. The next walk-away asks the server to check first, so no redundant lock if it's already locked. |
+| Right next to the car for 30 s **without driving** (e.g. you opened it to grab something), or back near it after walking away | Arms. The next walk-away asks the server to check first: it locks only if the car is unlocked. |
 | No network when you walk away | Retries with back-off for several minutes, and shows an **"Auto-lock can't reach the server"** alert so you can lock it yourself. |
 
 It never unlocks anything.

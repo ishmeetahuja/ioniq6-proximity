@@ -46,9 +46,9 @@ import java.util.concurrent.Executors
  * if the car's Bluetooth doesn't connect within POWERCUT_WAIT_MS we hand over to the server
  * with check-first, which skips the lock if the car is on.
  *
- * From AWAY, coming back near the tag for a minute re-arms (PARKED). Later walk-aways in the
- * same stop ask the server to check the car first, so pacing around an already-locked car
- * doesn't fire lock commands every time. If the tag never shows up after parking (dead power
+ * Without a drive (app just started, or AWAY), being right next to the tag for 30 s arms too —
+ * e.g. you opened the car to grab something. Those walk-aways, and repeats in the same stop,
+ * ask the server to check the car first, so an already-locked car is left alone. If the tag never shows up after parking (dead power
  * bank…), we fall back to car Bluetooth alone with the server's normal grace period.
  */
 class ProximityService : Service() {
@@ -68,7 +68,8 @@ class ProximityService : Service() {
         private const val RSSI_HOLD_MS = 3_000L      // signal must stay weak this long
         private const val FALLBACK_MS = 45_000L      // tag never connected after parking → car-Bluetooth fallback
         private const val SCAN_MS = 45_000L          // active search for the ESP32 after parking
-        private const val REARM_MS = 60_000L         // strong signal this long while AWAY → re-arm
+        private const val REARM_MS = 30_000L         // near the tag this long without driving → arm
+        private const val AWAY_COUNT_RESET_MS = 30 * 60_000L
         private const val POWERCUT_WAIT_MS = 90_000L // after a power cut, wait this long for car Bluetooth
         private const val POWERCUT_MARGIN_DB = 12    // dropped while this much stronger than threshold → power cut
         private const val HEALTH_EVERY_MS = 15 * 60_000L
@@ -115,6 +116,8 @@ class ProximityService : Service() {
     private var tagSeenThisStop = false
     private var fallbackSent = false
     private var awaysThisStop = 0
+    private var armedByProximity = false   // armed by standing near the car, not by a drive ending
+    private var lastAwayAt = 0L
     private var scanning = false
     private var scanGen = 0
     private var lastHealthAt = 0L
@@ -232,6 +235,7 @@ class ProximityService : Service() {
     private fun arm(why: String) {
         parkedAt = now()
         awaysThisStop = 0
+        armedByProximity = false
         fallbackSent = false
         belowSince = 0
         aboveSince = 0
@@ -396,16 +400,22 @@ class ProximityService : Service() {
                     belowSince = 0
                 }
             }
-            Mode.AWAY -> {
+            // Not driving, but you're right by the car (e.g. you opened it to grab something,
+            // or came back after walking away): after REARM_MS close to the tag, arm. The next
+            // walk-away asks the server to check first, so an already-locked car is left alone.
+            Mode.AWAY, Mode.UNKNOWN -> {
                 if (espConnected && s != null && s > threshold + HYSTERESIS_DB) {
                     if (aboveSince == 0L) aboveSince = t
                     if (t - aboveSince > REARM_MS) {
+                        val why = if (mode == Mode.AWAY) "back near the car — re-armed" else "near the car (no drive) — armed"
                         aboveSince = 0
                         belowSince = 0
                         tagSeenThisStop = true
                         dropWasPowerCut = false
+                        armedByProximity = true
+                        if (t - lastAwayAt > AWAY_COUNT_RESET_MS) awaysThisStop = 0
                         parkedAt = t - SETTLE_MS // already settled
-                        setMode(Mode.PARKED, "back near the car — re-armed")
+                        setMode(Mode.PARKED, why)
                         send("/v1/autolock/near", """{"source":"esp32"}""", "near")
                     }
                 } else {
@@ -426,9 +436,11 @@ class ProximityService : Service() {
             return
         }
         setMode(Mode.AWAY, reason)
-        // First walk-away: lock immediately (the tag already proves you left).
-        // Later ones in the same stop: have the server check first, so no redundant lock.
-        val body = if (awaysThisStop == 1) """{"source":"esp32","graceSeconds":0}"""
+        lastAwayAt = now()
+        // First walk-away after a drive: lock immediately (the tag already proves you left).
+        // Otherwise (armed by proximity, or a repeat in the same stop): have the server check
+        // first, so an already-locked car gets no redundant lock.
+        val body = if (awaysThisStop == 1 && !armedByProximity) """{"source":"esp32","graceSeconds":0}"""
                    else """{"source":"esp32","graceSeconds":0,"checkFirst":true}"""
         send("/v1/autolock/away", body, "away")
     }
