@@ -80,6 +80,11 @@ Check the power bank first: plug the ESP32 into it, leave it 5 minutes, and make
 still blinking. Some power banks switch off when the load is this small — use one with a
 low-current / "trickle" mode (often a double-press of its button), or a different bank.
 
+Many power banks (without "pass-through charging") cut their output while they're being
+charged, so the ESP32 is **off while you drive** and boots when you switch the car off. That's
+fine: the app searches for it as soon as you park. What matters is that the bank turns its
+output back on by itself once the car stops charging it.
+
 ## 3 · Install the app
 
 1. On the phone, open the latest release and download `ioniq6-autolock.apk`.
@@ -111,14 +116,24 @@ On the server, auto-lock is on and set to fast mode (the defaults).
 | Situation | What happens |
 |---|---|
 | Car Bluetooth connects | **Driving.** Any pending lock is cancelled. |
-| Car Bluetooth disconnects | **Parked.** Starts watching the ESP32. |
-| Signal below threshold for 3 s, or link down for 5 s | **Away.** Server locks immediately. |
-| First 10 s after parking | Ignores ESP32 hiccups (the power bank switching over can reboot it). |
-| ESP32 never connects within 25 s of parking | Falls back to car Bluetooth only; the server uses its normal grace period. |
+| Car Bluetooth disconnects | **Parked.** Searches for the ESP32 (it has usually just booted) and connects. |
+| Signal below threshold for 3 s, or the link drops after fading | **Away.** Server locks immediately. |
+| Link drops while the signal was still strong | Treated as the ESP32 **losing power** (you started the car) — never locks by itself. If the car's Bluetooth doesn't connect within 90 s, the server checks the car and only locks if it's off. |
+| First 10 s after parking | Ignores ESP32 hiccups. |
+| ESP32 not found within 45 s of parking | Falls back to car Bluetooth only; the server uses its normal grace period. |
 | Back near the car (strong signal) for 60 s | Re-arms. The next walk-away asks the server to check first, so no redundant lock if it's already locked. |
-| No network when you walk away | Retries with back-off for several minutes. The server's safety-net check covers the rest. |
+| No network when you walk away | Retries with back-off for several minutes, and shows an **"Auto-lock can't reach the server"** alert so you can lock it yourself. |
 
 It never unlocks anything.
+
+**Pause:** the app's **Pause 2 h** button (also on its notification) stops auto-lock on the
+server — for a car wash, or someone waiting in the car. **Resume** turns it back on.
+
+**The status notification** can be swiped away on Android 14+. Monitoring keeps running; the
+notification comes back at the next status change.
+
+**Server watchdog:** the installer sets up a check every 3 minutes that restarts the server's
+containers if it stops answering, and tells you via ntfy when it had to.
 
 ## Building locally (optional)
 

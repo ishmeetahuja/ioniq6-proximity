@@ -44,6 +44,7 @@ class MainActivity : Activity() {
     private lateinit var tokenEdit: EditText
     private lateinit var thrEdit: EditText
     private lateinit var runSwitch: Switch
+    private lateinit var pauseView: TextView
     private lateinit var logView: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,6 +57,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         handler.post(refresher)
+        if (prefs.configured) Thread { Api.check(prefs) }.start()   // fresh server + pause state
     }
 
     override fun onPause() {
@@ -95,6 +97,9 @@ class MainActivity : Activity() {
             setOnCheckedChangeListener { _, on -> if (on) startMonitoring() else stopMonitoring() }
         }
         root.addView(runSwitch)
+
+        pauseView = text("", 14f)
+        row(button("Pause 2 h") { doPause(120) }, button("Resume") { doPause(0) })
 
         section("1 · Server")
         urlEdit = edit("https://car.example.com", prefs.serverUrl, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
@@ -170,7 +175,13 @@ class MainActivity : Activity() {
     private fun render() {
         val sig = Status.rssi?.let { "$it dBm (raw ${Status.rawRssi})" } ?: "—"
         val car = when (Status.carConnected) { true -> "connected"; false -> "disconnected"; null -> "unknown" }
-        statusView.text = "${Status.mode}\nESP32: ${if (Status.espConnected) "connected · $sig" else "not connected"}\nCar Bluetooth: $car"
+        val server = Status.serverProblem?.let { "⚠ $it" } ?: "OK"
+        statusView.text = "${Status.mode}\nESP32: ${if (Status.espConnected) "connected · $sig" else "not connected"}\nCar Bluetooth: $car\nServer: $server"
+        pauseView.text = when {
+            !Status.autolockEnabled -> "Auto-lock is turned off on the server"
+            Status.pausedUntil != null -> "Auto-lock paused until ${localTime(Status.pausedUntil!!)}"
+            else -> "Auto-lock active"
+        }
         if (runSwitch.isChecked != Status.running) {
             runSwitch.setOnCheckedChangeListener(null)
             runSwitch.isChecked = Status.running
@@ -180,6 +191,11 @@ class MainActivity : Activity() {
         espView.text = prefs.espAddress ?: "Not chosen"
         logView.text = Status.logText().ifEmpty { "(nothing yet)" }
     }
+
+    private fun localTime(iso: String): String = try {
+        java.time.Instant.parse(iso).atZone(java.time.ZoneId.systemDefault())
+            .format(java.time.format.DateTimeFormatter.ofPattern("h:mm a"))
+    } catch (_: Exception) { iso }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
@@ -216,18 +232,18 @@ class MainActivity : Activity() {
         saveServer()
         if (!prefs.configured) return
         Thread {
-            val msg = try {
-                val r = Api.request(prefs, "GET", "/v1/autolock")
-                when (r.code) {
-                    200 -> "Server OK — auto-lock " + (if (r.body.contains("\"enabled\": true")) "enabled" else "disabled")
-                    401 -> "Server reached, but the token was rejected"
-                    else -> "Server answered HTTP ${r.code}"
-                }
-            } catch (e: Exception) {
-                "Couldn't reach the server: ${e.message}"
-            }
+            val msg = Api.check(prefs)
             Status.log(msg)
             runOnUiThread { toast(msg) }
+        }.start()
+    }
+
+    private fun doPause(minutes: Int) {
+        if (!prefs.configured) { toast("Set up the server first"); return }
+        Thread {
+            val msg = Api.pause(prefs, minutes)
+            Status.log(msg)
+            runOnUiThread { toast(msg); render() }
         }.start()
     }
 

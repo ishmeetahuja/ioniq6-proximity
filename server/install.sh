@@ -144,6 +144,58 @@ volumes:
 EOF2
 }
 
+# Every 3 minutes: if HTTPS stops answering, bring the containers back up (and say so via ntfy).
+install_watchdog() {
+  cat > "$DIR/watchdog.sh" <<'EOF2'
+#!/bin/bash
+# Installed by install.sh — keeps the IONIQ 6 API answering.
+cd /opt/ioniq6 || exit 0
+dom=$(grep '^DOMAIN=' .env | cut -d= -f2-)
+ntfy=$(grep '^NTFY_URL=' .env | cut -d= -f2-)
+healthy() { curl --noproxy '*' -fsS -m 10 --resolve "${dom}:443:127.0.0.1" "https://${dom}/healthz" >/dev/null 2>&1; }
+healthy && exit 0
+sleep 15; healthy && exit 0            # a single slow answer isn't an outage
+logger -t ioniq6-watchdog "API not answering; starting containers"
+docker compose up -d >/dev/null 2>&1
+for _ in $(seq 1 12); do sleep 5; healthy && break; done
+if ! healthy; then
+  logger -t ioniq6-watchdog "still down; restarting containers"
+  docker compose restart >/dev/null 2>&1
+  for _ in $(seq 1 12); do sleep 5; healthy && break; done
+fi
+if healthy; then msg="The IONIQ 6 server had stopped answering and restarted itself. It's working again."
+else msg="The IONIQ 6 server is down and couldn't restart itself. Run: cd /opt/ioniq6 && sudo bash install.sh doctor"; fi
+logger -t ioniq6-watchdog "$msg"
+[ -n "$ntfy" ] && curl -fsS -m 10 -H "Title: IONIQ 6 server" -d "$msg" "$ntfy" >/dev/null 2>&1
+exit 0
+EOF2
+  chmod 755 "$DIR/watchdog.sh"
+  if ! command -v systemctl >/dev/null || [ ! -d /run/systemd/system ]; then
+    echo "(No systemd here — skipping the automatic watchdog.)"; return 0
+  fi
+  cat > /etc/systemd/system/ioniq6-watchdog.service <<EOF2
+[Unit]
+Description=IONIQ 6 API watchdog
+After=docker.service
+[Service]
+Type=oneshot
+ExecStart=${DIR}/watchdog.sh
+EOF2
+  cat > /etc/systemd/system/ioniq6-watchdog.timer <<'EOF2'
+[Unit]
+Description=Check the IONIQ 6 API every 3 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+[Install]
+WantedBy=timers.target
+EOF2
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl enable --now ioniq6-watchdog.timer >/dev/null 2>&1
+  echo "Watchdog on: checks the server every 3 minutes and restarts it if needed."
+}
+
 # ------------------------------------------------------------------ doctor: find what's broken
 doctor() {
   local dom ip code err local_ok=0 public_ok=0 fails=0
@@ -175,6 +227,16 @@ doctor() {
   if [ "$code" = 200 ]; then public_ok=1; pass "HTTPS reachable through the public address"
   else fail "HTTPS NOT reachable through the public address ($(head -c 160 "$err"))"; fi
   rm -f "$err"
+
+  if command -v systemctl >/dev/null && systemctl is-active --quiet ioniq6-watchdog.timer 2>/dev/null; then
+    pass "watchdog running (restarts the server if it stops)"
+  else
+    fail "watchdog not running — run: sudo bash install.sh"
+  fi
+  if journalctl -t ioniq6-watchdog --since "-7 days" 2>/dev/null | grep -q "restarted itself"; then
+    echo "  note  the watchdog restarted the server in the last 7 days:"
+    journalctl -t ioniq6-watchdog --since "-7 days" -o short 2>/dev/null | grep -i "restart" | tail -3 | sed 's/^/        /'
+  fi
 
   local mem swap
   mem=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
@@ -238,6 +300,7 @@ if [ -f .env ]; then
   write_files
   docker compose up -d
   wait_healthy
+  install_watchdog
   if api GET /v1/auth | grep -q '"loggedIn": false'; then
     echo "Not signed in to BlueLink yet — finishing that now."
     do_login
@@ -294,6 +357,7 @@ say "Starting…"
 docker compose pull
 docker compose up -d
 wait_healthy
+install_watchdog
 
 do_login
 
