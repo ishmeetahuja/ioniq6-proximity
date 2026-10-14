@@ -1,0 +1,10 @@
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+.idea/
+# PlatformIO
+firmware/.pio/
+firmware/.vscode/
