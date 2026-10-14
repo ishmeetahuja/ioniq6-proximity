@@ -69,6 +69,80 @@ show_details() {
   [ -n "$ntfy" ] && echo "  ntfy topic:   ${ntfy##*/}"
 }
 
+# Small instances (512 MB) have no swap by default; a memory spike (image pulls, OS updates)
+# can freeze the whole box. 1 GB of swap on disk prevents that.
+ensure_swap() {
+  local mem_mb
+  mem_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+  [ "$mem_mb" -lt 1500 ] || return 0
+  [ "$(swapon --show --noheadings | wc -l)" -eq 0 ] || return 0
+  say "Adding 1 GB of swap (this server has ${mem_mb} MB of RAM)"
+  fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+}
+
+# The free *.sslip.io name contains the server's IP. If the IP changed (restart without a
+# static IP, or a static IP attached later), point the name at the new IP.
+fix_ip() {
+  local dom ip want
+  dom=$(grep '^DOMAIN=' .env | cut -d= -f2-)
+  case "$dom" in *.sslip.io) ;; *) return 0 ;; esac
+  ip=$(curl -fsS https://checkip.amazonaws.com 2>/dev/null || true)
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
+  want="${ip//./-}.sslip.io"
+  [ "$dom" = "$want" ] && return 0
+  say "This server's IP address changed"
+  echo "  old: $dom"
+  echo "  new: $want"
+  sed -i "s|^DOMAIN=.*|DOMAIN=${want}|; s|^PUBLIC_URL=.*|PUBLIC_URL=https://${want}|" .env
+  echo "Put the new server address (below) in the phone app."
+  echo "To stop this happening again: Lightsail → your instance → Networking → attach a static IP."
+  echo "(Attaching one changes the IP once more — just run this installer again afterwards.)"
+}
+
+write_files() {
+  cat > Caddyfile <<'EOF2'
+{$DOMAIN} {
+	encode gzip
+	reverse_proxy api:8080
+}
+EOF2
+  cat > docker-compose.yml <<EOF2
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+services:
+  api:
+    image: ${IMAGE}
+    env_file: .env
+    environment:
+      TRUST_PROXY: "true"
+    volumes:
+      - ioniq6_data:/data
+    restart: unless-stopped
+    logging: *logging
+  caddy:
+    image: caddy:2
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: \${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api]
+    restart: unless-stopped
+    logging: *logging
+volumes:
+  ioniq6_data:
+  caddy_data:
+  caddy_config:
+EOF2
+}
+
 # ------------------------------------------------------------------ redo verification only
 if [ "${1:-}" = "login" ]; then
   [ -f .env ] || { echo "Not installed yet — run without 'login' first."; exit 1; }
@@ -81,7 +155,21 @@ fi
 # ------------------------------------------------------------------ update an existing install
 if [ -f .env ]; then
   say "Existing install in $DIR — updating to the latest version"
-  docker compose pull
+  ensure_swap
+  if [ -z "${IONIQ6_REEXEC:-}" ]; then
+    docker compose pull
+    # Continue with the installer from the new image, so updates also update this script.
+    NEW=$(mktemp)
+    docker run --rm "$IMAGE" cat /app/install.sh > "$NEW" 2>/dev/null || true
+    if [ -s "$NEW" ] && ! cmp -s "$NEW" "$DIR/install.sh"; then
+      cp "$NEW" "$DIR/install.sh"; rm -f "$NEW"
+      echo "Installer updated — continuing with the new version."
+      IONIQ6_REEXEC=1 exec bash "$DIR/install.sh" "$@"
+    fi
+    rm -f "$NEW"
+  fi
+  fix_ip
+  write_files
   docker compose up -d
   wait_healthy
   if api GET /v1/auth | grep -q '"loggedIn": false'; then
@@ -96,6 +184,7 @@ fi
 
 # ------------------------------------------------------------------ first install
 say "IONIQ 6 API setup"
+ensure_swap
 IP=$(curl -fsS https://checkip.amazonaws.com 2>/dev/null || true)
 DEFAULT_HOST=""
 [ -n "$IP" ] && DEFAULT_HOST="${IP//./-}.sslip.io"
@@ -133,39 +222,7 @@ NTFY_URL=https://ntfy.sh/${TOPIC}
 EOF
 umask 022
 
-cat > Caddyfile <<'EOF'
-{$DOMAIN} {
-	encode gzip
-	reverse_proxy api:8080
-}
-EOF
-
-cat > docker-compose.yml <<EOF
-services:
-  api:
-    image: ${IMAGE}
-    env_file: .env
-    environment:
-      TRUST_PROXY: "true"
-    volumes:
-      - ioniq6_data:/data
-    restart: unless-stopped
-  caddy:
-    image: caddy:2
-    ports: ["80:80", "443:443"]
-    environment:
-      DOMAIN: \${DOMAIN}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    depends_on: [api]
-    restart: unless-stopped
-volumes:
-  ioniq6_data:
-  caddy_data:
-  caddy_config:
-EOF
+write_files
 
 say "Starting…"
 docker compose pull

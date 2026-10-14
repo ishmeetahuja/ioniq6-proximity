@@ -46,7 +46,8 @@ image; an installer sets everything up on a small AWS server, including HTTPS.
    At the end it prints your **server address** and **phone token** for the app, and an
    **ntfy topic** for notifications.
 
-- Update later: `cd /opt/ioniq6 && sudo bash install.sh`
+- Update later: `cd /opt/ioniq6 && sudo bash install.sh`. It also fixes the address if the
+  server's IP changed, and adds swap on small (512 MB) servers so they don't freeze.
 - Redo Hyundai's email verification: `cd /opt/ioniq6 && sudo bash install.sh login`
 - Logs: `cd /opt/ioniq6 && sudo docker compose logs -f api`
 
