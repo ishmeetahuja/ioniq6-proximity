@@ -22,6 +22,39 @@ Every push to `main` builds both pieces on GitHub and publishes them under **Rel
 
 ---
 
+## 0 · The server on AWS (once)
+
+The server (`server/`) is the piece that talks to Hyundai. GitHub builds it as a container
+image; an installer sets everything up on a small AWS server, including HTTPS.
+
+1. **Create the server.** AWS console → **Lightsail** → Create instance:
+   region **Canada (Montreal)**, platform **Linux**, blueprint **OS Only → Ubuntu 24.04 LTS**,
+   the smallest plan. Create it.
+2. **Give it a fixed address.** Instance → **Networking** → **Attach static IP** (create one).
+   Hyundai ties each login to an IP, so the address must not change.
+3. **Open HTTPS.** Same Networking tab → IPv4 firewall → **Add rule → HTTPS (443)**.
+   (SSH 22 and HTTP 80 are already open; 80 is needed for the certificate.)
+4. **Install.** Click **Connect using SSH** (opens a terminal in the browser) and paste:
+
+   ```bash
+   curl -fsSL https://get.docker.com | sudo sh
+   sudo docker run --rm ghcr.io/ishmeetahuja/ioniq6-api cat /app/install.sh > install.sh && sudo bash install.sh
+   ```
+
+   It asks for a hostname (press Enter — it uses a free `<your-ip>.sslip.io` name with a real
+   HTTPS certificate), your BlueLink email, password and PIN, then the code Hyundai emails you.
+   At the end it prints your **server address** and **phone token** for the app, and an
+   **ntfy topic** for notifications.
+
+- Update later: `cd /opt/ioniq6 && sudo bash install.sh`
+- Redo Hyundai's email verification: `cd /opt/ioniq6 && sudo bash install.sh login`
+- Logs: `cd /opt/ioniq6 && sudo docker compose logs -f api`
+
+**Tokens, briefly:** the installer makes two random passwords. The **phone token** goes in
+the app: it can lock the car and run auto-lock, but can never unlock or start it — so a lost
+phone or a leaked automation can't open the car. The **admin token** (in `/opt/ioniq6/.env`)
+can do everything; keep it to yourself. Full API reference: `server/README.md`.
+
 ## 1 · Flash the ESP32
 
 No software to install — use Chrome or Edge on a computer:

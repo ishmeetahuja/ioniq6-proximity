@@ -58,6 +58,37 @@ jobs:
           name: firmware
           path: esp32-car-tag.bin
 
+  server:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Smoke test the image
+        run: |
+          docker build -t ioniq6-api server
+          docker run -d --name smoke -p 8080:8080 \
+            -e ADMIN_TOKEN=$(openssl rand -hex 24) -e BLUELINK_USERNAME=a -e BLUELINK_PASSWORD=b -e BLUELINK_PIN=1234 \
+            ioniq6-api
+          for i in $(seq 1 20); do curl -fsS localhost:8080/healthz && break; sleep 1; done
+          docker logs smoke
+          curl -fsS localhost:8080/healthz
+          docker run --rm ioniq6-api cat /app/install.sh | head -3
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: server
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository_owner }}/ioniq6-api:latest
+
   release:
     needs: [android, firmware]
     runs-on: ubuntu-latest
