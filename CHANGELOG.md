@@ -10,6 +10,23 @@ different, in plain words, with an example. Newest first.
 
 ---
 
+## Build 29 — Oct 15, 2026 · app + server
+
+**Clearer messages when a lock has to wait.**
+
+- **ntfy now tells you how a delayed lock ended.** Example from this afternoon: you walked away
+  at 1:30 while Hyundai was still blocking the server. ntfy said the lock was delayed, then
+  nothing more, even though the car locked at 1:35. Now you get a second message, **"Car locked"**,
+  when it goes through. Normal locks still show only in the app, so no doubled-up messages.
+- **The delay message is less alarming.** It says **"Lock delayed, still trying"** and that
+  "Car locked" will follow, instead of "Auto-lock delayed".
+- **The "Couldn't ask the car… until 1:31 PM" line under the status now disappears** once a lock
+  goes through, or after 15 minutes. Before, it stayed on screen long after it stopped being true.
+
+**Update:** app and server.
+
+---
+
 ## Build 28 — Oct 15, 2026 · app + server
 
 **The app tells you what's really going on with the car, and it asks Hyundai less often.**

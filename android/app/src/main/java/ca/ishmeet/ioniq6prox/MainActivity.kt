@@ -78,6 +78,8 @@ class MainActivity : Activity() {
     private var busy = false            // one car command at a time
     private var lastAttemptAt = 0L
     private var refreshProblem: String? = null
+        set(v) { field = v; if (v != null) refreshProblemAt = System.currentTimeMillis() }
+    private var refreshProblemAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -110,7 +112,14 @@ class MainActivity : Activity() {
     private val ticker = object : Runnable {
         override fun run() {
             renderAutoLock()
-            if (Status.seq != lastSeq) { lastSeq = Status.seq; CarApi.cached(prefs)?.let { car = it }; renderCar() }
+            if (Status.seq != lastSeq) {
+                lastSeq = Status.seq
+                CarApi.cached(prefs)?.let { car = it }
+                if (prefs.lockConfirmedAt > refreshProblemAt) refreshProblem = null   // a lock went through since
+                renderCar()
+            }
+            // An old "couldn't ask the car" note goes away after 15 minutes.
+            if (refreshProblem != null && System.currentTimeMillis() - refreshProblemAt > 15 * 60_000L) { refreshProblem = null; renderCar() }
             maybeRefresh()
             handler.postDelayed(this, 1_000)
         }

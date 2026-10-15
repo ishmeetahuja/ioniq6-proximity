@@ -295,7 +295,7 @@ function alDelay(untilIso, why) {
   alEvent('delayed', `${why}; trying again at ${hhmm(at)}`);
   if (!AL.delayNotified) {
     AL.delayNotified = true;
-    notify({ title: 'Auto-lock delayed', message: `Hyundai is rate-limiting the server. I'll lock the car at about ${hhmm(at)} and keep trying. Lock it yourself if you can.`, priority: 'high', tags: ['warning', 'car'] });
+    notify({ title: 'Lock delayed, still trying', message: `Hyundai is busy, so the lock waits until about ${hhmm(at)} and keeps retrying. You'll get "Car locked" when it goes through. Lock it yourself if you can.`, priority: 'high', tags: ['hourglass', 'car'] });
   }
 }
 function alEvent(type, detail) {
@@ -392,7 +392,8 @@ async function alCheck() {
   AL.phase = 'checking';
   AL.attempt += 1;
   const attempt = AL.attempt;
-  const quietNote = (n) => { if (!AL.quiet) notify(n); };
+  // Quiet = the phone shows the result itself. But if we told ntfy about a delay, also tell it how it ended.
+  const quietNote = (n) => { if (!AL.quiet || AL.delayNotified) notify(n); };
   const cancelled = () => { if (!AL.cancelled) return false; alFinish('cancelled', 'back near the car'); alReset(); return true; };
   try {
     if (attempt === 1 && !(AL.checkFirst ?? state.checkFirst)) {
