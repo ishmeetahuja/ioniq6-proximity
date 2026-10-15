@@ -22,6 +22,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
+import android.net.wifi.WifiInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -50,6 +55,11 @@ import java.util.concurrent.Executors
  * e.g. you opened the car to grab something. Those walk-aways, and repeats in the same stop,
  * ask the server to check the car first, so an already-locked car is left alone. If the tag never shows up after parking (dead power
  * bank…), we fall back to car Bluetooth alone with the server's normal grace period.
+ *
+ *   HOME     — (home mode on) parked at home: on the home Wi-Fi, or within the home circle.
+ *              Locks ONCE, homeDelaySec after parking (or not at all if a walk-away already
+ *              locked it this stop), then ignores the tag until the next drive — walking around
+ *              the house near the driveway doesn't keep locking the car.
  */
 class ProximityService : Service() {
 
@@ -75,6 +85,8 @@ class ProximityService : Service() {
         private const val HEALTH_EVERY_MS = 15 * 60_000L
         private const val HYSTERESIS_DB = 8
         private const val MAX_AWAYS_PER_STOP = 5
+        private const val HOME_DETECT_MS = 2 * 60_000L // after parking, look for "home" this long
+        private const val LOCATE_RETRY_MS = 20_000L
 
         fun hasPermissions(c: Context): Boolean {
             val need = mutableListOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
@@ -96,7 +108,7 @@ class ProximityService : Service() {
         }
     }
 
-    private enum class Mode(val label: String) { UNKNOWN("Waiting for car"), DRIVING("Driving"), PARKED("Parked — watching"), AWAY("Away") }
+    private enum class Mode(val label: String) { UNKNOWN("Waiting for car"), DRIVING("Driving"), PARKED("Parked — watching"), AWAY("Away"), HOME("At home") }
 
     private lateinit var prefs: Prefs
     private val handler = Handler(Looper.getMainLooper())
@@ -123,6 +135,10 @@ class ProximityService : Service() {
     private var lastHealthAt = 0L
     private var lastNotifText = ""
     private var lastNotifAt = 0L
+    private var homeCheckUntil = 0L      // >0: still working out whether we parked at home
+    private var nextLocateAt = 0L
+    private var locating = false
+    @Volatile private var wifiName: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -140,6 +156,7 @@ class ProximityService : Service() {
         }
         Status.running = true
         registerAclReceiver()
+        registerWifiWatch()
         connectTag(direct = false)
         checkCarAlreadyConnected()
         handler.post(tick)
@@ -160,6 +177,7 @@ class ProximityService : Service() {
         handler.removeCallbacksAndMessages(null)
         stopScan()
         try { unregisterReceiver(aclReceiver) } catch (_: Exception) {}
+        try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(wifiCb) } catch (_: Exception) {}
         try { gatt?.close() } catch (_: SecurityException) {}
         gatt = null
         if (::net.isInitialized) net.shutdown()
@@ -221,6 +239,7 @@ class ProximityService : Service() {
 
     private fun onCarConnected() {
         Status.carConnected = true
+        homeCheckUntil = 0
         stopScan()
         if (mode == Mode.DRIVING) return
         setMode(Mode.DRIVING, "car Bluetooth connected")
@@ -245,6 +264,78 @@ class ProximityService : Service() {
         linkDownSince = if (espConnected) 0 else now()
         setMode(Mode.PARKED, why)
         if (!espConnected) startScan()
+        if (Home.enabled(prefs)) {
+            homeCheckUntil = parkedAt + HOME_DETECT_MS
+            nextLocateAt = parkedAt
+            checkHome(parkedAt)
+        } else homeCheckUntil = 0
+    }
+
+    // ------------------------------------------------------------------ home
+
+    // Android tells us the Wi-Fi name as it joins (needs location permission, "all the time").
+    private val wifiCb = object : ConnectivityManager.NetworkCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO) {
+        override fun onCapabilitiesChanged(n: Network, caps: NetworkCapabilities) {
+            val ssid = Home.clean((caps.transportInfo as? WifiInfo)?.ssid) ?: return
+            handler.post {
+                if (ssid == wifiName) return@post
+                wifiName = ssid
+                if (homeCheckUntil > 0) checkHome(now())
+            }
+        }
+        override fun onLost(n: Network) { handler.post { wifiName = null } }
+    }
+
+    private fun registerWifiWatch() {
+        try {
+            val req = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+            getSystemService(ConnectivityManager::class.java)?.registerNetworkCallback(req, wifiCb)
+        } catch (e: Exception) { Status.log("Can't watch Wi-Fi: ${e.message}") }
+    }
+
+    private fun wifiNow(): String? = wifiName ?: Home.currentWifi(this)
+
+    /** While the post-parking window is open: home Wi-Fi now? Otherwise ask for a location fix. */
+    private fun checkHome(t: Long) {
+        if (homeCheckUntil == 0L || mode == Mode.HOME || mode == Mode.DRIVING) return
+        if (t > homeCheckUntil) {
+            homeCheckUntil = 0
+            Status.log("Not at home (no home Wi-Fi or location within 2 min of parking)")
+            return
+        }
+        val wifi = wifiNow()
+        if (Home.isHomeWifi(prefs, wifi)) { enterHome("on home Wi-Fi “$wifi”"); return }
+        if (prefs.homeLat == null || locating || t < nextLocateAt) return
+        if (!Home.hasLocation(this)) { nextLocateAt = Long.MAX_VALUE; Status.log("Home mode: no location permission — using Wi-Fi only"); return }
+        locating = true
+        Home.locate(this) { loc ->
+            locating = false
+            if (homeCheckUntil == 0L || mode == Mode.HOME || mode == Mode.DRIVING) return@locate
+            if (loc == null) { nextLocateAt = now() + LOCATE_RETRY_MS; return@locate }
+            val d = Home.distance(prefs, loc) ?: return@locate
+            if (Home.inside(prefs, loc)) enterHome("parked ${Home.describe(d)} from home")
+            else if (loc.accuracy > 300) nextLocateAt = now() + LOCATE_RETRY_MS   // too vague to rule home out
+            else { nextLocateAt = Long.MAX_VALUE; Status.log("Parked ${Home.describe(d)} from home — normal walk-away") }
+        }
+    }
+
+    /** Parked at home: one lock (unless one was already sent this stop), then quiet until the next drive. */
+    private fun enterHome(why: String) {
+        if (mode == Mode.HOME) return
+        homeCheckUntil = 0
+        stopScan()
+        val alreadySent = awaysThisStop > 0
+        awaysThisStop++
+        belowSince = 0
+        aboveSince = 0
+        if (alreadySent) {
+            setMode(Mode.HOME, "$why — already locked once, staying quiet until the next drive")
+            return
+        }
+        val left = (prefs.homeDelaySec - (now() - parkedAt) / 1000).coerceIn(0, 600)
+        setMode(Mode.HOME, "$why — locking once in ${left}s, then quiet until the next drive")
+        lastAwayAt = now()
+        send("/v1/autolock/away", """{"source":"home","graceSeconds":$left}""", "away")
     }
 
     // ------------------------------------------------------------------ ESP32 tag
@@ -365,6 +456,7 @@ class ProximityService : Service() {
         if (t - lastHealthAt > HEALTH_EVERY_MS) { lastHealthAt = t; checkServer() }
         val threshold = prefs.awayRssi
         val s = smoothed
+        if (homeCheckUntil > 0) checkHome(t)
 
         when (mode) {
             Mode.PARKED -> {
@@ -403,10 +495,16 @@ class ProximityService : Service() {
             // Not driving, but you're right by the car (e.g. you opened it to grab something,
             // or came back after walking away): after REARM_MS close to the tag, arm. The next
             // walk-away asks the server to check first, so an already-locked car is left alone.
-            Mode.AWAY, Mode.UNKNOWN -> {
+            // HOME too: if you're near the car somewhere that isn't home (a drive the phone missed),
+            // normal walk-away takes over again.
+            Mode.AWAY, Mode.UNKNOWN, Mode.HOME -> {
                 if (espConnected && s != null && s > threshold + HYSTERESIS_DB) {
                     if (aboveSince == 0L) aboveSince = t
-                    if (t - aboveSince > REARM_MS) {
+                    if (t - aboveSince > REARM_MS && Home.atHomeNow(this, prefs, wifiName)) {
+                        // At home the tag is often in range from the house: never re-arm there.
+                        aboveSince = 0
+                        if (mode != Mode.HOME) setMode(Mode.HOME, "near the car at home — staying quiet until the next drive")
+                    } else if (t - aboveSince > REARM_MS) {
                         val why = if (mode == Mode.AWAY) "back near the car — re-armed" else "near the car (no drive) — armed"
                         aboveSince = 0
                         belowSince = 0

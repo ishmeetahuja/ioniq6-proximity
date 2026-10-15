@@ -51,6 +51,23 @@ class Prefs(c: Context) {
         get() = sp.getInt("cmin", 15)
         set(v) { sp.edit().putInt("cmin", v).apply() }
 
+    /** Home mode: at home, lock once after parking, then stay quiet until the next drive. */
+    var homeOn: Boolean
+        get() = sp.getBoolean("homeOn", false)
+        set(v) { sp.edit().putBoolean("homeOn", v).apply() }
+    var homeWifi: String
+        get() = sp.getString("homeWifi", "") ?: ""
+        set(v) { sp.edit().putString("homeWifi", v.trim()).apply() }
+    val homeLat: Double? get() = sp.getString("homeLat", null)?.toDoubleOrNull()
+    val homeLon: Double? get() = sp.getString("homeLon", null)?.toDoubleOrNull()
+    fun setHomeSpot(spot: Pair<Double, Double>?) {
+        sp.edit().putString("homeLat", spot?.first?.toString()).putString("homeLon", spot?.second?.toString()).apply()
+    }
+    /** Seconds after parking at home before the one lock. */
+    var homeDelaySec: Int
+        get() = sp.getInt("homeDelay", 60)
+        set(v) { sp.edit().putInt("homeDelay", v).apply() }
+
     val configured: Boolean get() = serverUrl.startsWith("https://") && token.isNotBlank()
     val hasAdmin: Boolean get() = adminToken.isNotBlank()
 }

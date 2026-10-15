@@ -57,6 +57,11 @@ class SettingsActivity : Activity() {
     private lateinit var thrEdit: EditText
     private lateinit var liveSignal: TextView
     private lateinit var logView: TextView
+    private lateinit var homeValue: TextView
+    private lateinit var locValue: TextView
+    private lateinit var wifiEdit: EditText
+    private lateinit var spotEdit: EditText
+    private lateinit var delayEdit: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -160,6 +165,23 @@ class SettingsActivity : Activity() {
             addView(row(dp(10), pillButton("Save") { saveThreshold() }, pillButton("Use current signal", Ui.GLACIER, Ui.ON_ACCENT) { useCurrentSignal() }), Ui.lp(top = dp(16)))
         }
 
+        section(col, "Home", "Parked at home, the car locks once, then the app stays quiet until your next drive, even if the tag is in range from the house. It knows you're home from your Wi-Fi or your location.") {
+            homeValue = item("Home mode", "Switch") { toggleHome() }
+            locValue = item("Location access", "Allow") { askLocation() }
+            label("Home Wi-Fi name")
+            wifiEdit = field("Wi-Fi name", prefs.homeWifi)
+            addView(wifiEdit, Ui.lp(top = dp(6)))
+            label("Home location: latitude, longitude")
+            val spot = prefs.homeLat?.let { "$it, ${prefs.homeLon}" } ?: ""
+            spotEdit = field("46.49, -80.90", spot, InputType.TYPE_CLASS_TEXT)
+            addView(spotEdit, Ui.lp(top = dp(6)))
+            addView(row(dp(10), pillButton("Use current Wi-Fi") { useCurrentWifi() }, pillButton("Use current location") { useCurrentSpot() }), Ui.lp(top = dp(12)))
+            label("Lock this many seconds after parking")
+            delayEdit = field("60", prefs.homeDelaySec.toString(), InputType.TYPE_CLASS_NUMBER)
+            addView(delayEdit, Ui.lp(top = dp(6)))
+            addView(row(dp(10), pillButton("Save") { saveHome() }, pillButton("Am I home?", Ui.GLACIER, Ui.ON_ACCENT) { checkHomeNow() }), Ui.lp(top = dp(16)))
+        }
+
         section(col, "Background and testing") {
             item("Battery", "Allow") { askBatteryExemption() }.text = "Let it keep watching while the screen is off"
             item("Test", "Arm") {
@@ -187,6 +209,96 @@ class SettingsActivity : Activity() {
         liveSignal.text = Status.rssi?.let { "Now: $it dBm" } ?: "No live signal"
         liveSignal.setTextColor(if (Status.rssi != null) Ui.TEXT else Ui.FAINT)
         logView.text = Status.logText().ifEmpty { "Nothing yet." }
+        homeValue.text = if (prefs.homeOn) "On, locks ${prefs.homeDelaySec} s after parking at home" else "Off"
+        homeValue.setTextColor(if (prefs.homeOn) Ui.GLACIER else Ui.MUTED)
+        locValue.text = when {
+            Home.hasBackground(this) -> "All the time"
+            Home.hasLocation(this) -> "Only while the app is open. Tap Allow, then pick “Allow all the time”"
+            else -> "Not allowed (needed to see the Wi-Fi name and location)"
+        }
+        locValue.setTextColor(if (Home.hasBackground(this)) Ui.MUTED else Ui.AMBER)
+    }
+
+    // ------------------------------------------------------------------ home
+
+    /** Saves the fields. Returns false (and says why) if something doesn't make sense. */
+    private fun storeHome(quiet: Boolean = false): Boolean {
+        val spotText = spotEdit.text.toString().trim()
+        val spot = if (spotText.isEmpty()) null else Home.parse(spotText)
+        if (spotText.isNotEmpty() && spot == null) { bar.show("Location should look like: 46.48998, -80.90417", Ui.CORAL); return false }
+        val delay = delayEdit.text.toString().trim().toIntOrNull()
+        if (delay == null || delay !in 0..600) { bar.show("Use 0 to 600 seconds", Ui.CORAL); return false }
+        prefs.homeWifi = wifiEdit.text.toString()
+        prefs.setHomeSpot(spot)
+        prefs.homeDelaySec = delay
+        if (!quiet) bar.show("Saved", Ui.GLACIER)
+        render()
+        return true
+    }
+
+    private fun saveHome() { storeHome() }
+
+    private fun toggleHome() {
+        if (prefs.homeOn) { prefs.homeOn = false; render(); bar.show("Home mode off"); return }
+        if (!storeHome(quiet = true)) return
+        if (prefs.homeWifi.isBlank() && prefs.homeLat == null) { bar.show("Enter your home Wi-Fi name or location first", Ui.AMBER); return }
+        prefs.homeOn = true
+        render()
+        if (!Home.hasBackground(this)) { bar.show("Home mode on. Now allow location all the time.", Ui.AMBER); askLocation() }
+        else bar.show("Home mode on", Ui.GLACIER)
+    }
+
+    private fun askLocation() {
+        when {
+            Home.hasBackground(this) -> bar.show("Already allowed all the time", Ui.GLACIER)
+            !Home.hasLocation(this) -> requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 2)
+            else -> sheet("One more step", "Android opens the app's location setting next. Choose “Allow all the time” so the app can see your Wi-Fi name and location after you park, with the screen off.") { d ->
+                addView(pillButton("Continue", Ui.GLACIER, Ui.ON_ACCENT) {
+                    d.dismiss()
+                    requestPermissions(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION), 3)
+                }, Ui.lp(top = dp(18)))
+            }
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 2 && Home.hasLocation(this)) askLocation()   // on to "all the time"
+        render()
+    }
+
+    private fun useCurrentWifi() {
+        if (!Home.hasLocation(this)) { bar.show("Allow location first: Android hides the Wi-Fi name without it", Ui.AMBER); askLocation(); return }
+        val w = Home.currentWifi(this) ?: run { bar.show("Not connected to Wi-Fi right now", Ui.AMBER); return }
+        wifiEdit.setText(w)
+        storeHome(quiet = true)
+        bar.show("Home Wi-Fi: $w", Ui.GLACIER)
+    }
+
+    private fun useCurrentSpot() {
+        if (!Home.hasLocation(this)) { askLocation(); return }
+        bar.show("Getting your location…", ms = 30_000)
+        Home.locate(this) { loc ->
+            if (loc == null) { bar.show("Couldn't get a location. Is location turned on?", Ui.CORAL); return@locate }
+            spotEdit.setText(String.format(java.util.Locale.US, "%.6f, %.6f", loc.latitude, loc.longitude))
+            storeHome(quiet = true)
+            bar.show("Home location set (accurate to about ${loc.accuracy.toInt()} m)", Ui.GLACIER)
+        }
+    }
+
+    private fun checkHomeNow() {
+        if (!storeHome(quiet = true)) return
+        if (!Home.hasLocation(this)) { bar.show("Allow location first", Ui.AMBER); askLocation(); return }
+        val wifi = Home.currentWifi(this)
+        if (Home.isHomeWifi(prefs, wifi)) { bar.show("Yes: on home Wi-Fi “$wifi”", Ui.GLACIER, 5_000); return }
+        if (prefs.homeLat == null) { bar.show("No: Wi-Fi is ${wifi?.let { "“$it”" } ?: "off"} and no home location is set", Ui.AMBER, 5_000); return }
+        bar.show("Checking location…", ms = 30_000)
+        Home.locate(this) { loc ->
+            if (loc == null) { bar.show("Couldn't get a location", Ui.CORAL); return@locate }
+            val d = Home.describe(Home.distance(prefs, loc) ?: 0f)
+            if (Home.inside(prefs, loc)) bar.show("Yes: $d from the home spot", Ui.GLACIER, 5_000)
+            else bar.show("No: $d from the home spot, Wi-Fi ${wifi?.let { "“$it”" } ?: "off"}", Ui.AMBER, 5_000)
+        }
     }
 
     // ------------------------------------------------------------------ actions

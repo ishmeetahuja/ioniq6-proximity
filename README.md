@@ -130,6 +130,9 @@ The home screen shows the car, its state, the controls and the walk-away lock. S
 6. **Settings → Walk-away distance**: put the ESP32 in its spot in the car, walk to where you'd want
    the car to lock (10–15 m is a good start) and tap **Use current signal**.
 7. Back on the home screen, turn **Walk-away lock** on.
+8. Optional, **Settings → Home**: type your home Wi-Fi name (or tap **Use current Wi-Fi** at home),
+   tap **Use current location** while standing at the driveway, then **Home mode → Switch** and
+   allow location **"Allow all the time"**. **Am I home?** tests it.
 
 ## 5 · Test it
 
@@ -150,6 +153,7 @@ On the server, auto-lock is on and set to fast mode (the defaults).
 | First 10 s after parking | Ignores ESP32 hiccups. |
 | ESP32 not found within 45 s of parking | Falls back to car Bluetooth only; the server uses its normal grace period. |
 | Right next to the car for 30 s **without driving** (e.g. you opened it to grab something), or back near it after walking away | Arms. The next walk-away asks the server to check first: it locks only if the car is unlocked. |
+| **Home mode:** parked at home (home Wi-Fi, or within ~150 m of the home spot, checked for 2 min after parking) | Locks **once**, 60 s after parking (adjustable; ntfy has a Cancel button), or not at all if a walk-away already locked it. Then ignores the tag until the next drive, so walking around the house never re-locks. |
 | No network when you walk away | Retries with back-off for several minutes, and shows an **"Auto-lock can't reach the server"** alert so you can lock it yourself. |
 
 It never unlocks anything.
