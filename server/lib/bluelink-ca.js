@@ -65,7 +65,7 @@ class BlueLinkCA {
    * @param {(msg)=>void} [o.debug]
    * @param {number} [o.pollMs]        delay between action-status polls (default 5000)
    */
-  constructor({ creds, session, saveSession, baseUrl, debug, pollMs } = {}) {
+  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs } = {}) {
     if (!creds?.username || !creds?.password || !creds?.pin) {
       throw new BlueLinkError('BlueLink username, password and PIN are all required.', 'INPUT');
     }
@@ -75,6 +75,7 @@ class BlueLinkCA {
     this.host = (baseUrl || 'https://mybluelink.ca').replace(/\/$/, '');
     this.api = this.host + '/tods/api/';
     this.debug = debug || null;
+    this.warn = warn || ((m) => console.warn(`[bluelink] ${m}`));
     this.pollMs = pollMs || 5000;
     if (!this.session.deviceId) {
       // Generated once and persisted; reusing it is what stops repeat OTP prompts.
@@ -130,7 +131,7 @@ class BlueLinkCA {
           const safe = JSON.stringify(json).replace(/"(accessToken|refreshToken|pAuth|otpKey|otpValidationKey)":"[^"]+"/g, '"$1":"***"');
           this.debug(`${endpoint} -> ${safe.slice(0, 2000)}`);
         }
-        return { json, headers: res.headers };
+        return { json, headers: res.headers, status: res.status };
       } catch (e) {
         if (e instanceof BlueLinkError) throw e;
         lastErr = e;
@@ -141,12 +142,29 @@ class BlueLinkCA {
     throw new BlueLinkError(`Network error talking to ${this.host}: ${lastErr && (lastErr.cause?.message || lastErr.message)}`, 'NETWORK');
   }
 
-  static check(json) {
+  /** Hyundai answered, but not with its usual success/error envelope (gateway error, rate limit…). */
+  static isOddReply(json) {
+    return get(json, 'responseHeader.responseCode') !== 0 && !(json && typeof json.error === 'object' && json.error && json.error.errorCode);
+  }
+
+  static mask(json) {
+    return JSON.stringify(json).replace(/"(accessToken|refreshToken|pAuth|otpKey|otpValidationKey|password|pin)":"[^"]*"/g, '"$1":"***"');
+  }
+
+  static check(json, { endpoint = '', status } = {}) {
     if (get(json, 'responseHeader.responseCode') === 0) return;
-    const err = json.error || {};
-    const ec = String(err.errorCode ?? 'unknown');
-    const desc = err.errorDesc || ERROR_HINTS[ec] || 'Unknown error';
-    throw new BlueLinkError(ERROR_HINTS[ec] && err.errorDesc ? `${desc} (${ec}) — ${ERROR_HINTS[ec]}` : `${desc} (${ec})`, ec);
+    const err = json && typeof json.error === 'object' && json.error ? json.error : null;
+    if (err && err.errorCode) {
+      const ec = String(err.errorCode);
+      const desc = err.errorDesc || ERROR_HINTS[ec] || 'Hyundai reported an error';
+      throw new BlueLinkError(ERROR_HINTS[ec] && err.errorDesc ? `${desc} (${ec}) — ${ERROR_HINTS[ec]}` : `${desc} (${ec})`, ec);
+    }
+    // Not Hyundai's usual envelope: say what we actually got.
+    const desc = get(json, 'responseHeader.responseDesc') || json?.message || json?.error || json?.errorMessage;
+    const http = status && status !== 200 ? `HTTP ${status}` : null;
+    const what = [http, typeof desc === 'string' ? desc : null].filter(Boolean).join(': ');
+    const hint = status === 429 ? ' Hyundai is rate-limiting requests; wait a few minutes.' : '';
+    throw new BlueLinkError(`Hyundai gave an unexpected answer${endpoint ? ' to ' + endpoint : ''}${what ? ' (' + what + ')' : ''}.${hint}`, status === 429 ? 'RATE_LIMIT' : 'ODD_REPLY');
   }
 
   // ------------------------------------------------------------ auth
@@ -259,7 +277,16 @@ class BlueLinkCA {
       await this.relogin();
       res = await go();
     }
-    if (!allowFail) BlueLinkCA.check(res.json);
+    if (BlueLinkCA.isOddReply(res.json)) {
+      // Log it (masked) so `docker compose logs api` shows what Hyundai sent, then retry once.
+      this.warn(`${endpoint}: unexpected reply (HTTP ${res.status}) ${BlueLinkCA.mask(res.json).slice(0, 500)}`);
+      if (!allowFail) {
+        await sleep(res.status === 429 ? 5000 : 2000);
+        res = await go();
+        if (BlueLinkCA.isOddReply(res.json)) this.warn(`${endpoint}: still unexpected after retry (HTTP ${res.status}) ${BlueLinkCA.mask(res.json).slice(0, 500)}`);
+      }
+    }
+    if (!allowFail) BlueLinkCA.check(res.json, { endpoint, status: res.status });
     return res;
   }
 

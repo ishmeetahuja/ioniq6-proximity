@@ -90,6 +90,7 @@ const bl = new BlueLinkCA({
   baseUrl: CFG.baseUrl,
   pollMs: CFG.pollMs,
   debug: env.IONIQ6_DEBUG ? (m) => log('[debug]', m) : null,
+  warn: (m) => log('[bluelink]', m),
 });
 
 // Hyundai doesn't like concurrent sessions/commands from one device: run one operation at a time.
@@ -387,6 +388,7 @@ function httpError(e) {
     if (e.code === 'INPUT' || e.code === '7549') return [400, { error: e.message }];
     if (e.code === 'OTP_REQUIRED' || e.code === 'NO_OTP') return [409, { error: e.message, code: e.code, next: 'POST /v1/auth/login' }];
     if (e.code === 'NETWORK') return [504, { error: e.message, code: e.code }];
+    if (e.code === 'RATE_LIMIT') return [429, { error: e.message, code: e.code }];
     return [502, { error: e.message, code: e.code }];
   }
   log('unexpected error:', e.stack);
