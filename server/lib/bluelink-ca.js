@@ -151,6 +151,12 @@ class BlueLinkCA {
     return JSON.stringify(json).replace(/"(accessToken|refreshToken|pAuth|otpKey|otpValidationKey|password|pin)":"[^"]*"/g, '"$1":"***"');
   }
 
+  /** check(), but log (masked) any reply that isn't Hyundai's usual envelope first. */
+  verify(res, endpoint) {
+    if (BlueLinkCA.isOddReply(res.json)) this.warn(`${endpoint}: unexpected reply (HTTP ${res.status}) ${BlueLinkCA.mask(res.json).slice(0, 500)}`);
+    BlueLinkCA.check(res.json, { endpoint, status: res.status });
+  }
+
   static check(json, { endpoint = '', status } = {}) {
     if (get(json, 'responseHeader.responseCode') === 0) return;
     const err = json && typeof json.error === 'object' && json.error ? json.error : null;
@@ -172,10 +178,11 @@ class BlueLinkCA {
   /** @returns {Promise<{ok:true}|{otpRequired:true,email:string,phone:string|null}>} */
   async login() {
     delete this.session.accessToken;
-    const { json } = await this.raw('v2/login', { body: { loginId: this.creds.username, password: this.creds.password } });
+    const login = await this.raw('v2/login', { body: { loginId: this.creds.username, password: this.creds.password } });
+    const { json } = login;
     if (json.responseHeader?.responseCode === 1 && json.error?.errorCode === '7110') {
       const sel = await this.raw('mfa/selverifmeth', { body: { mfaApiCode: '0107', userAccount: this.creds.username } });
-      BlueLinkCA.check(sel.json);
+      this.verify(sel, 'mfa/selverifmeth');
       const r = sel.json.result || {};
       this.session.pendingMfa = {
         userInfoUuid: r.userInfoUuid,
@@ -185,7 +192,7 @@ class BlueLinkCA {
       this.save();
       return { otpRequired: true, email: this.session.pendingMfa.email, phone: this.session.pendingMfa.phone };
     }
-    BlueLinkCA.check(json);
+    this.verify(login, 'v2/login');
     this.storeToken(json.result.token);
     return { ok: true };
   }
@@ -202,8 +209,9 @@ class BlueLinkCA {
     const body = method === 'sms'
       ? { otpMethod: 'S', mfaApiCode: '0107', userAccount: m.email, userPhone: m.phone, userInfoUuid: m.userInfoUuid }
       : { otpMethod: 'E', mfaApiCode: '0107', userAccount: m.email, userPhone: '', userInfoUuid: m.userInfoUuid };
-    const { json } = await this.raw('mfa/sendotp', { body });
-    BlueLinkCA.check(json);
+    const sent = await this.raw('mfa/sendotp', { body });
+    this.verify(sent, 'mfa/sendotp');
+    const { json } = sent;
     this.session.pendingOtp = { otpKey: json.result.otpKey, email: m.email, at: Date.now() };
     this.save();
     return { via: method, to: method === 'sms' ? m.phone : m.email };
@@ -215,12 +223,12 @@ class BlueLinkCA {
     const v = await this.raw('mfa/validateotp', {
       body: { otpNo: String(code).trim(), userAccount: this.creds.username, otpKey: p.otpKey, mfaApiCode: '0107' },
     });
-    BlueLinkCA.check(v.json);
+    this.verify(v, 'mfa/validateotp');
     if (!v.json.result?.verifiedOtp) throw new BlueLinkError('That code was not accepted.', '7549');
     const t = await this.raw('mfa/genmfatkn', {
       body: { userAccount: this.creds.username, otpEmail: p.email, mfaApiCode: '0107', otpValidationKey: v.json.result.otpValidationKey, mfaYn: 'Y' },
     });
-    BlueLinkCA.check(t.json);
+    this.verify(t, 'mfa/genmfatkn');
     delete this.session.pendingOtp;
     delete this.session.pendingMfa;
     this.storeToken(t.json.result.token);
