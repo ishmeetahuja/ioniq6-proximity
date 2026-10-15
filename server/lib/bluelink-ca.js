@@ -65,7 +65,7 @@ class BlueLinkCA {
    * @param {(msg)=>void} [o.debug]
    * @param {number} [o.pollMs]        delay between action-status polls (default 5000)
    */
-  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs } = {}) {
+  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs, minCooldownSec, loginRetrySec } = {}) {
     if (!creds?.username || !creds?.password || !creds?.pin) {
       throw new BlueLinkError('BlueLink username, password and PIN are all required.', 'INPUT');
     }
@@ -77,6 +77,10 @@ class BlueLinkCA {
     this.debug = debug || null;
     this.warn = warn || ((m) => console.warn(`[bluelink] ${m}`));
     this.pollMs = pollMs || 5000;
+    // Back-off: Hyundai sits behind Cloudflare, which bans an IP that keeps knocking.
+    this.minCooldownMs = (minCooldownSec ?? 600) * 1000;   // after a 429, stay away at least this long
+    this.loginRetryMs = (loginRetrySec ?? 300) * 1000;     // after a failed sign-in, wait before the next
+    this.cache = {};                                       // slow-changing reads (service info, charge limits)
     if (!this.session.deviceId) {
       // Generated once and persisted; reusing it is what stops repeat OTP prompts.
       this.session.deviceId = Buffer.from(crypto.randomUUID().replace(/-/g, '')).toString('base64');
@@ -109,7 +113,27 @@ class BlueLinkCA {
     };
   }
 
+  /** ISO time until which we don't contact Hyundai (rate-limited), or null. */
+  get cooldownUntil() {
+    const t = this.session.cooldownUntil || 0;
+    return t > Date.now() ? new Date(t).toISOString() : null;
+  }
+
+  coolDown(seconds, why) {
+    const ms = Math.max(this.minCooldownMs, (Number(seconds) || 0) * 1000);
+    this.session.cooldownUntil = Date.now() + ms;
+    this.save();
+    this.warn(`${why}: not contacting Hyundai until ${new Date(this.session.cooldownUntil).toISOString()}`);
+  }
+
+  rateLimitError() {
+    const until = new Date(this.session.cooldownUntil);
+    const hhmm = until.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: process.env.TZ || 'America/Toronto' });
+    return new BlueLinkError(`Hyundai is rate-limiting this server, so it's pausing requests until about ${hhmm}. It recovers on its own.`, 'RATE_LIMIT');
+  }
+
   async raw(endpoint, { body, headers = {} } = {}) {
+    if (this.cooldownUntil) throw this.rateLimitError();
     let lastErr;
     for (let attempt = 0, delay = 2000; attempt < 4; attempt++, delay *= 2) {
       try {
@@ -121,7 +145,14 @@ class BlueLinkCA {
         });
         const text = await res.text();
         let json;
-        try { json = JSON.parse(text); } catch {
+        try { json = JSON.parse(text); } catch { json = undefined; }
+        if (res.status === 429) {
+          const ra = (json && (json.retry_after ?? json.retryAfter)) || res.headers.get('retry-after');
+          if (json) this.warn(`${endpoint}: unexpected reply (HTTP 429) ${BlueLinkCA.mask(json).slice(0, 500)}`);
+          this.coolDown(ra, `${endpoint}: rate-limited by Hyundai (HTTP 429)`);
+          throw this.rateLimitError();
+        }
+        if (json === undefined) {
           if (res.status === 403 || /cloudflare|cf-ray/i.test(text)) {
             throw new BlueLinkError(`Blocked by Hyundai's firewall (HTTP ${res.status}). Try again later or from another network.`, 'HTTP');
           }
@@ -253,17 +284,34 @@ class BlueLinkCA {
     this.save();
   }
 
-  get loggedIn() { return !!this.session.accessToken && Date.now() < (this.session.expiresAt || 0); }
+  /** We hold a session token. (Whether Hyundai still accepts it is only known by using it.) */
+  get loggedIn() { return !!this.session.accessToken; }
 
   async ensureAuth() {
-    if (this.loggedIn) return;
+    // Sign in only when there's no token at all. An expired or rejected token is handled in
+    // call(), which signs in again only when Hyundai says so (7403/7602/7606) — far fewer
+    // sign-ins than renewing on a timer, which matters behind Cloudflare's rate limiting.
+    if (this.session.accessToken) return;
     await this.relogin();
   }
 
   async relogin() {
     // Canada has no refresh endpoint; a plain re-login with the persisted Deviceid
     // does not normally re-trigger OTP.
-    const r = await this.login();
+    const lastFail = this.session.loginFailedAt || 0;
+    if (Date.now() - lastFail < this.loginRetryMs) {
+      const mins = Math.ceil((this.loginRetryMs - (Date.now() - lastFail)) / 60000);
+      throw new BlueLinkError(`Signing in to Hyundai failed a moment ago; trying again in about ${mins} min.`, 'LOGIN_WAIT');
+    }
+    let r;
+    try {
+      r = await this.login();
+    } catch (e) {
+      if (e.code !== 'RATE_LIMIT' && e.code !== 'NETWORK') { this.session.loginFailedAt = Date.now(); this.save(); }
+      throw e;
+    }
+    delete this.session.loginFailedAt;
+    this.save();
     if (r.otpRequired) {
       throw new BlueLinkError('Hyundai needs a one-time verification code for this device.', 'OTP_REQUIRED');
     }
@@ -332,10 +380,24 @@ class BlueLinkCA {
     return json.result.status;
   }
 
+  /** Reads something that changes rarely, at most once per maxAgeMs. */
+  async cached(key, maxAgeMs, fn) {
+    const c = this.cache[key];
+    if (c && Date.now() - c.at < maxAgeMs) return c.value;
+    try {
+      const value = await fn();
+      this.cache[key] = { at: Date.now(), value };
+      return value;
+    } catch (e) {
+      if (c) return c.value;   // stale is better than nothing for these
+      throw e;
+    }
+  }
+
   async status({ refresh = false } = {}) {
     const s = await this.rawStatus({ refresh });
-    const svc = (await this.call('nxtsvc', {}, { allowFail: true })).json.result?.maintenanceInfo || {};
-    const soc = (await this.call('evc/selsoc', {}, { allowFail: true })).json.result;
+    const svc = await this.cached('svc', 6 * 3600e3, async () => (await this.call('nxtsvc', {}, { allowFail: true })).json.result?.maintenanceInfo || {}).catch(() => ({}));
+    const soc = await this.cached('soc', 30 * 60e3, async () => (await this.call('evc/selsoc', {}, { allowFail: true })).json.result).catch(() => null);
     return summarize({ s, svc, soc }, this.session);
   }
 
@@ -352,6 +414,7 @@ class BlueLinkCA {
   }
 
   async chargeLimits() {
+    delete this.cache.soc;
     const { json } = await this.call('evc/selsoc');
     const list = Array.isArray(json.result) ? json.result : (json.result?.tsoc || []);
     const cur = (t) => { const x = list.filter((l) => l.plugType === t).pop(); return x ? x.level : null; };
@@ -451,6 +514,7 @@ class BlueLinkCA {
     for (const [n, v] of [['ac', ac], ['dc', dc]]) {
       if (!(v >= 50 && v <= 100 && v % 10 === 0)) throw new BlueLinkError(`${n} limit must be 50–100 in steps of 10 (got ${v}).`, 'INPUT');
     }
+    delete this.cache.soc;
     const r = await this.command('evc/setsoc',
       { tsoc: [{ plugType: 0, level: dc }, { plugType: 1, level: ac }] },
       { ...o, extraHeaders: { from: 'SPA', Referer: this.host + '/remote/' } });

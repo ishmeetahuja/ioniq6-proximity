@@ -34,6 +34,9 @@ const CFG = {
   vin: env.BLUELINK_VIN || undefined,
   baseUrl: env.BLUELINK_BASE_URL || undefined,
   pollMs: num(env.BLUELINK_POLL_MS, 5000),
+  minCooldownSec: num(env.BLUELINK_MIN_COOLDOWN_SECONDS, 600),
+  loginRetrySec: num(env.BLUELINK_LOGIN_RETRY_SECONDS, 300),
+  statusCacheSec: num(env.STATUS_CACHE_SECONDS, 60),
   commandTimeout: num(env.COMMAND_TIMEOUT_SECONDS, 120),
   autolock: {
     enabled: bool(env.AUTOLOCK_ENABLED, true),
@@ -89,6 +92,8 @@ const bl = new BlueLinkCA({
   saveSession: (s) => writeJson(SESSION_FILE, s),
   baseUrl: CFG.baseUrl,
   pollMs: CFG.pollMs,
+  minCooldownSec: CFG.minCooldownSec,
+  loginRetrySec: CFG.loginRetrySec,
   debug: env.IONIQ6_DEBUG ? (m) => log('[debug]', m) : null,
   warn: (m) => log('[bluelink]', m),
 });
@@ -141,6 +146,7 @@ ${message}`, disable_notification: priority === 'low' || priority === 'min' };
 
 // ---------------------------------------------------------------- jobs (async commands)
 
+let statusCache = null;   // absorbs repeated app opens: at most one Hyundai status read per minute
 const jobs = new Map();
 function newJob(action, source) {
   const id = crypto.randomBytes(6).toString('hex');
@@ -159,6 +165,7 @@ function runJob(job, fn) {
       Object.assign(job, { status: 'error', error: e.message, code: e.code });
     }
     job.finishedAt = new Date().toISOString();
+    statusCache = null;   // the car just changed; next status read goes to Hyundai
     log(`job ${job.id} ${job.action} -> ${job.status}${job.error ? ': ' + job.error : ''}`);
     return job;
   });
@@ -388,7 +395,8 @@ function httpError(e) {
     if (e.code === 'INPUT' || e.code === '7549') return [400, { error: e.message }];
     if (e.code === 'OTP_REQUIRED' || e.code === 'NO_OTP') return [409, { error: e.message, code: e.code, next: 'POST /v1/auth/login' }];
     if (e.code === 'NETWORK') return [504, { error: e.message, code: e.code }];
-    if (e.code === 'RATE_LIMIT') return [429, { error: e.message, code: e.code }];
+    if (e.code === 'RATE_LIMIT') return [429, { error: e.message, code: e.code, until: bl.cooldownUntil }];
+    if (e.code === 'LOGIN_WAIT') return [503, { error: e.message, code: e.code }];
     return [502, { error: e.message, code: e.code }];
   }
   log('unexpected error:', e.stack);
@@ -412,7 +420,7 @@ const ROUTES = [
   ['GET', /^\/$/, 'none', (req, res) => send(res, 200, { name: 'ioniq6-api', version: VERSION, docs: 'see README.md' })],
 
   // auth bootstrap (one-time verification code for this server's device id)
-  ['GET', /^\/v1\/auth$/, 'admin', (req, res) => send(res, 200, { loggedIn: bl.loggedIn, vehicle: bl.session.vin ? bl.vehicleInfo() : null, otpPending: !!bl.session.pendingOtp })],
+  ['GET', /^\/v1\/auth$/, 'admin', (req, res) => send(res, 200, { loggedIn: bl.loggedIn, vehicle: bl.session.vin ? bl.vehicleInfo() : null, otpPending: !!bl.session.pendingOtp, rateLimitedUntil: bl.cooldownUntil })],
   ['POST', /^\/v1\/auth\/login$/, 'admin', async (req, res, url, body) => {
     const r = await serial(() => bl.login());
     if (r.ok) return send(res, 200, { status: 'logged_in', vehicle: await withCar(() => bl.vehicleInfo()) });
@@ -427,7 +435,13 @@ const ROUTES = [
 
   // reads
   ['GET', /^\/v1\/vehicles$/, 'admin', async (req, res) => send(res, 200, await serial(() => bl.vehicles()))],
-  ['GET', /^\/v1\/status$/, 'phone', async (req, res, url) => send(res, 200, await withCar(() => bl.status({ refresh: url.searchParams.get('refresh') === 'true' })))],
+  ['GET', /^\/v1\/status$/, 'phone', async (req, res, url) => {
+    const refresh = url.searchParams.get('refresh') === 'true';
+    if (!refresh && statusCache && Date.now() - statusCache.at < CFG.statusCacheSec * 1000) return send(res, 200, statusCache.value);
+    const value = await withCar(() => bl.status({ refresh }));
+    statusCache = { at: Date.now(), value };
+    send(res, 200, value);
+  }],
   ['GET', /^\/v1\/location$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.location()))],
   ['GET', /^\/v1\/charge-limit$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.chargeLimits()))],
   ['GET', /^\/v1\/trips$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.trips()))],
