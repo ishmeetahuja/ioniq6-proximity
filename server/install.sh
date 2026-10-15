@@ -12,11 +12,18 @@
 set -euo pipefail
 SELF=$(readlink -f "$0")
 
-DIR=/opt/ioniq6
+# Unraid keeps persistent data under /mnt/user/appdata (its root filesystem lives in RAM).
+if [ -f /etc/unraid-version ]; then UNRAID=1; DEFAULT_DIR=/mnt/user/appdata/ioniq6; else UNRAID=""; DEFAULT_DIR=/opt/ioniq6; fi
+DIR=${IONIQ6_DIR:-$DEFAULT_DIR}
 IMAGE=ghcr.io/ishmeetahuja/ioniq6-api:latest
 
-if [ "$(id -u)" -ne 0 ]; then echo "Run with sudo: sudo bash install.sh"; exit 1; fi
-command -v docker >/dev/null || { echo "Docker isn't installed. Run: curl -fsSL https://get.docker.com | sudo sh"; exit 1; }
+if [ "$(id -u)" -ne 0 ]; then echo "Run as root: sudo bash install.sh"; exit 1; fi
+if [ -n "$UNRAID" ]; then
+  command -v docker >/dev/null || { echo "Docker isn't running. Unraid → Settings → Docker → Enable Docker: Yes."; exit 1; }
+  docker compose version >/dev/null 2>&1 || { echo "Needs Docker Compose: Unraid → Apps → search \"Compose Manager Plus\" → Install, then run this again."; exit 1; }
+else
+  command -v docker >/dev/null || { echo "Docker isn't installed. Run: curl -fsSL https://get.docker.com | sudo sh"; exit 1; }
+fi
 mkdir -p "$DIR"
 [ "$SELF" != "$DIR/install.sh" ] && cp "$SELF" "$DIR/install.sh"
 cd "$DIR"
@@ -55,7 +62,7 @@ do_login() {
     echo "Signed in."
   else
     echo "BlueLink sign-in didn't finish: $R"
-    echo "Retry with:  cd $DIR && sudo bash install.sh login"
+    echo "Retry with:  cd $DIR && bash install.sh login"
   fi
 }
 
@@ -104,6 +111,30 @@ fix_ip() {
   echo "(Attaching one changes the IP once more — just run this installer again afterwards.)"
 }
 
+# 443 is required. 80 is optional: Caddy can get its certificate over 443 alone (TLS-ALPN),
+# so on boxes where something else owns port 80 (Unraid's web UI) we simply don't bind it.
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+ours_running() { [ -n "$(docker compose ps -q --status running caddy 2>/dev/null)" ]; }
+
+check_ports() {
+  if ! ours_running && port_busy 443; then
+    say "Port 443 is already in use on this machine"
+    if [ -n "$UNRAID" ]; then
+      echo "That's usually Unraid's own web interface (HTTPS). Move it so the car server can use 443:"
+      echo "  Unraid → Settings → Management Access → HTTPS port: 4443 (or set Use SSL/TLS: No) → Apply"
+      echo "Then open Unraid at https://<server-ip>:4443 and run this installer again."
+    else
+      echo "Something else is listening on 443. Stop it, or put this server on another machine."
+    fi
+    exit 1
+  fi
+  if grep -q '^BIND_HTTP=no' .env 2>/dev/null; then BIND_HTTP=no
+  elif ours_running || ! port_busy 80; then BIND_HTTP=yes
+  else BIND_HTTP=no; echo "(Port 80 is taken here, so only 443 is used. That's fine.)"
+  fi
+  if [ "$BIND_HTTP" = yes ]; then PORTS='"80:80", "443:443"'; else PORTS='"443:443"'; fi
+}
+
 write_files() {
   cat > Caddyfile <<'EOF2'
 {$DOMAIN} {
@@ -127,7 +158,7 @@ services:
     logging: *logging
   caddy:
     image: caddy:2
-    ports: ["80:80", "443:443"]
+    ports: [${PORTS}]
     environment:
       DOMAIN: \${DOMAIN}
     volumes:
@@ -149,7 +180,7 @@ install_watchdog() {
   cat > "$DIR/watchdog.sh" <<'EOF2'
 #!/bin/bash
 # Installed by install.sh — keeps the IONIQ 6 API answering.
-cd /opt/ioniq6 || exit 0
+cd "__DIR__" || exit 0
 dom=$(grep '^DOMAIN=' .env | cut -d= -f2-)
 ntfy=$(grep '^NTFY_URL=' .env | cut -d= -f2-)
 healthy() { curl --noproxy '*' -fsS -m 10 --resolve "${dom}:443:127.0.0.1" "https://${dom}/healthz" >/dev/null 2>&1; }
@@ -164,12 +195,21 @@ if ! healthy; then
   for _ in $(seq 1 12); do sleep 5; healthy && break; done
 fi
 if healthy; then msg="The IONIQ 6 server had stopped answering and restarted itself. It's working again."
-else msg="The IONIQ 6 server is down and couldn't restart itself. Run: cd /opt/ioniq6 && sudo bash install.sh doctor"; fi
+else msg="The IONIQ 6 server is down and couldn't restart itself. Run: cd __DIR__ && bash install.sh doctor"; fi
 logger -t ioniq6-watchdog "$msg"
 [ -n "$ntfy" ] && curl -fsS -m 10 -H "Title: IONIQ 6 server" -d "$msg" "$ntfy" >/dev/null 2>&1
 exit 0
 EOF2
+  sed -i "s|__DIR__|$DIR|g" "$DIR/watchdog.sh"
   chmod 755 "$DIR/watchdog.sh"
+  if [ -n "$UNRAID" ]; then
+    # Unraid loads cron entries from /boot/config/plugins/*/*.cron (kept on the USB stick).
+    mkdir -p /boot/config/plugins/ioniq6
+    printf '# IONIQ 6 API watchdog\n*/3 * * * * %s/watchdog.sh > /dev/null 2>&1\n' "$DIR" > /boot/config/plugins/ioniq6/ioniq6-watchdog.cron
+    if command -v update_cron >/dev/null; then update_cron; echo "Watchdog on: checks the server every 3 minutes and restarts it if needed."
+    else echo "Watchdog script installed; it starts with the next reboot (or use the User Scripts plugin to run $DIR/watchdog.sh every 3 min)."; fi
+    return 0
+  fi
   if ! command -v systemctl >/dev/null || [ ! -d /run/systemd/system ]; then
     echo "(No systemd here — skipping the automatic watchdog.)"; return 0
   fi
@@ -228,7 +268,8 @@ doctor() {
   else fail "HTTPS NOT reachable through the public address ($(head -c 160 "$err"))"; fi
   rm -f "$err"
 
-  if command -v systemctl >/dev/null && systemctl is-active --quiet ioniq6-watchdog.timer 2>/dev/null; then
+  if { command -v systemctl >/dev/null && systemctl is-active --quiet ioniq6-watchdog.timer 2>/dev/null; } || \
+     { [ -n "$UNRAID" ] && crontab -l 2>/dev/null | grep -q ioniq6/watchdog.sh; }; then
     pass "watchdog running (restarts the server if it stops)"
   else
     fail "watchdog not running — run: sudo bash install.sh"
@@ -297,6 +338,7 @@ if [ -f .env ]; then
     rm -f "$NEW"
   fi
   fix_ip
+  check_ports
   write_files
   docker compose up -d
   wait_healthy
@@ -314,6 +356,7 @@ fi
 # ------------------------------------------------------------------ first install
 say "IONIQ 6 API setup"
 ensure_swap
+check_ports
 IP=$(curl -fsS https://checkip.amazonaws.com 2>/dev/null || true)
 DEFAULT_HOST=""
 [ -n "$IP" ] && DEFAULT_HOST="${IP//./-}.sslip.io"
@@ -348,6 +391,7 @@ AUTOLOCK_GRACE_SECONDS=20
 AUTOLOCK_CHECK_FIRST=false
 GUARD_INTERVAL_MINUTES=30
 NTFY_URL=https://ntfy.sh/${TOPIC}
+BIND_HTTP=${BIND_HTTP}
 EOF
 umask 022
 
@@ -369,8 +413,14 @@ for _ in $(seq 1 30); do
   sleep 2
 done
 if [ -z "$OK" ]; then
-  echo "HTTPS isn't answering yet. Most likely port 443 is closed: in Lightsail → your instance →"
-  echo "Networking → IPv4 firewall → Add rule → HTTPS. It will start working within a minute after that."
+  if [ -n "$UNRAID" ]; then
+    echo "HTTPS isn't answering from the internet yet. Forward TCP port 443 to this server in your router"
+    echo "(eero app → Settings → Network settings → Reservations & port forwarding). Then check with:"
+    echo "  cd $DIR && bash install.sh doctor"
+  else
+    echo "HTTPS isn't answering yet. Most likely port 443 is closed: in Lightsail → your instance →"
+    echo "Networking → IPv4 firewall → Add rule → HTTPS. It will start working within a minute after that."
+  fi
 fi
 
 say "Done. Put these in the phone app:"
@@ -380,4 +430,4 @@ echo
 echo "Notifications: install the ntfy app and subscribe to topic:  ${TOPIC}"
 echo
 echo "Admin token (keep private — it can unlock the car): saved in ${DIR}/.env"
-echo "Update later:  cd ${DIR} && sudo bash install.sh"
+echo "Update later:  cd ${DIR} && bash install.sh"

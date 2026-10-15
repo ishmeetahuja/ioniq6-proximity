@@ -56,6 +56,28 @@ the app: it can lock the car and run auto-lock, but can never unlock or start it
 phone or a leaked automation can't open the car. The **admin token** (in `/opt/ioniq6/.env`)
 can do everything; keep it to yourself. Full API reference: `server/README.md`.
 
+### Or: at home on Unraid (instead of AWS)
+
+The same installer works on Unraid. It keeps everything in `/mnt/user/appdata/ioniq6` and
+needs only **TCP 443** forwarded on your router.
+
+1. Unraid → **Apps** → install **Compose Manager Plus** (provides `docker compose`).
+2. Unraid → **Terminal** (top-right `>_`), paste:
+
+   ```bash
+   docker run --rm --pull always ghcr.io/ishmeetahuja/ioniq6-api cat /app/install.sh > /tmp/install.sh && bash /tmp/install.sh
+   ```
+
+   If it says port 443 is taken, that's Unraid's own web UI: **Settings → Management Access** →
+   set **HTTPS port** to `4443` (or **Use SSL/TLS: No**) → Apply, then paste the line again.
+3. **eero app → Settings → Network settings → Reservations & port forwarding**: pick the Unraid
+   server → **Reserve IP** → **Open port**: `443`, TCP. (If your ISP's modem is a router too,
+   forward 443 there as well, or put it in bridge mode.)
+4. Check: `cd /mnt/user/appdata/ioniq6 && bash install.sh doctor`
+
+Update: `cd /mnt/user/appdata/ioniq6 && bash install.sh`. If your home IP changes, run that
+again — it moves the `sslip.io` name to the new IP — then update the address in the app.
+
 ## 1 · Flash the ESP32
 
 No software to install — use Chrome or Edge on a computer:
