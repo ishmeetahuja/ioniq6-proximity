@@ -475,7 +475,7 @@ class ProximityService : Service() {
             setMode(Mode.HOME, "away from the car ${prefs.homeDelaySec}s — locking once")
             // Lock straight away (harmless if it's already locked). Only after a power cut (car
             // maybe running) does the server check first; it skips the lock if the car is on.
-            lockAway("home", "You left the car at home", checkFirst = dropWasPowerCut)
+            lockAway("home", "you'd been away from the car for ${prefs.homeDelaySec} s (home rule)", "home rule", checkFirst = dropWasPowerCut)
         }
     }
 
@@ -628,7 +628,7 @@ class ProximityService : Service() {
                     awaysThisStop++
                     stopScan()
                     setMode(Mode.AWAY, "ESP32 not reachable — using car Bluetooth only")
-                    lockAway("car-bluetooth", "You parked (ESP32 not found)", useServerGrace = true)
+                    lockAway("car-bluetooth", "you parked and the ESP32 wasn't found", "parking", useServerGrace = true)
                     return
                 }
                 val settled = t - parkedAt > SETTLE_MS
@@ -642,7 +642,7 @@ class ProximityService : Service() {
                                 powerCutHandled = true
                                 awaysThisStop++
                                 setMode(Mode.AWAY, "ESP32 lost power and car Bluetooth never came back")
-                                lockAway("esp32-power-lost", "ESP32 lost power and the car's Bluetooth never came back", checkFirst = true)
+                                lockAway("esp32-power-lost", "the ESP32 lost power and the car's Bluetooth never came back", "backup rule", checkFirst = true)
                             }
                         } else if (t - linkDownSince > LINK_HOLD_MS) {
                             walkedAway("ESP32 out of range")
@@ -690,7 +690,7 @@ class ProximityService : Service() {
         lastAwayAt = now()
         // Lock straight away: harmless if it's already locked, and one command costs Hyundai less
         // than waking the car to check first.
-        lockAway("esp32", "You walked away")
+        lockAway("esp32", "you walked away: $reason", "walk-away")
     }
 
     // ------------------------------------------------------------------ lock feedback
@@ -699,15 +699,23 @@ class ProximityService : Service() {
      * Sends "lock" and follows it to the end: a double tap + "Locking your car…" now, then a firm
      * buzz + "Car locked" (or a long buzz + what went wrong) when the server reports the result.
      */
-    private fun lockAway(source: String, why: String, checkFirst: Boolean = false, useServerGrace: Boolean = false) {
+    // Why the current lock was sent, so every message about it can say so.
+    private var lockWhy = ""
+    private var lockBy = ""
+    private var lockDelayed = false
+
+    /** why: the reason in words ("you walked away (signal -96 dBm)"); by: a short label for the home screen. */
+    private fun lockAway(source: String, why: String, by: String, checkFirst: Boolean = false, useServerGrace: Boolean = false) {
         val gen = ++watchGen
+        lockWhy = why; lockBy = by; lockDelayed = false
+        Status.log("Locking because $why")
         Status.locking = true
         Status.lockMessage = "Locking your car…"
         Status.changed()
         buzz(BUZZ_SENT)
-        lockNotif("Locking your car…", why, problem = false)
+        lockNotif("Locking your car…", "Because ${why}.", problem = false)
         val json = buildString {
-            append("""{"source":"$source","quiet":true""")
+            append("""{"source":"$source","quiet":true,"reason":${org.json.JSONObject.quote(why)}""")
             if (!useServerGrace) append(""","graceSeconds":0""")
             if (checkFirst) append(""","checkFirst":true""")
             append("}")
@@ -750,6 +758,7 @@ class ProximityService : Service() {
                 }
                 if (j.optString("phase") == "delayed" && !delayShown) {
                     delayShown = true
+                    lockDelayed = true
                     val at = Ui.localTime(j.optString("locksAt").ifBlank { null })
                     handler.post {
                         if (gen != watchGen) return@post
@@ -765,14 +774,16 @@ class ProximityService : Service() {
 
     private fun lockResult(gen: Int, outcome: String, detail: String?) {
         when (outcome) {
-            "locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "Locked as you walked away", problem = false); readSavedSoon() }
-            "already-locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "It was already locked", problem = false); readSavedSoon() }
+            "locked" -> { prefs.confirmLock(true, lockBy); lockDone(gen, "Car locked", "Locked at ${clockNow()} because $lockWhy." + (if (lockDelayed) " It waited a moment because Hyundai was busy." else ""), problem = false); readSavedSoon() }
+            "already-locked" -> { prefs.confirmLock(true, lockBy); lockDone(gen, "Car locked", "It was already locked (checked because $lockWhy).", problem = false); readSavedSoon() }
             "car-on" -> lockDone(gen, "Not locked: the car is on", null, problem = false, quiet = true)
             "cancelled" -> lockDone(gen, "Lock cancelled", "You came back to the car", problem = false, quiet = true)
             "open" -> lockDone(gen, "Car NOT locked", "${detail ?: "Something is open"}. Close it and lock it.", problem = true)
             else -> lockDone(gen, "Car NOT locked", detail ?: "The lock didn't go through. Lock it yourself.", problem = true)
         }
     }
+
+    private fun clockNow() = java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date())
 
     /** A minute after a lock, read Hyundai's saved copy (doesn't wake the car): it has usually caught up by then. */
     private fun readSavedSoon() {

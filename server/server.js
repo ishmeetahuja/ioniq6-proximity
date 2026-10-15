@@ -295,7 +295,7 @@ function alDelay(untilIso, why) {
   alEvent('delayed', `${why}; trying again at ${hhmm(at)}`);
   if (!AL.delayNotified) {
     AL.delayNotified = true;
-    notify({ title: 'Lock delayed, still trying', message: `Hyundai is busy, so the lock waits until about ${hhmm(at)} and keeps retrying. You'll get "Car locked" when it goes through. Lock it yourself if you can.`, priority: 'high', tags: ['hourglass', 'car'] });
+    notify({ title: 'Lock delayed, still trying', message: `Locking because ${AL.reason || AL.source}, but Hyundai is busy, so it waits until about ${hhmm(at)} and keeps retrying. You'll get "Car locked" when it goes through. Lock it yourself if you can.`, priority: 'high', tags: ['hourglass', 'car'] });
   }
 }
 function alEvent(type, detail) {
@@ -305,7 +305,7 @@ function alEvent(type, detail) {
 }
 function alReset() {
   clearTimeout(AL.timer);
-  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, quiet: false, delayStarted: 0, delayNotified: false, delays: 0 });
+  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, quiet: false, delayStarted: 0, delayNotified: false, delays: 0, reason: null });
 }
 function alPublic() {
   return {
@@ -325,7 +325,16 @@ function alPublic() {
   };
 }
 
-function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null, quiet = false } = {}) {
+// Why a lock was sent, in words, for ntfy ("Car locked at 5:03 PM because …").
+const REASONS = {
+  esp32: 'you walked away from the car',
+  home: 'you left the car at home',
+  'car-bluetooth': 'you parked (the ESP32 wasn\'t found)',
+  'esp32-power-lost': 'the ESP32 lost power and the car didn\'t reconnect',
+  'phone went quiet': 'your phone went quiet after you parked (dead battery, no signal or app closed)',
+  'safety check': 'the 6-hour backup check found it off and unlocked',
+};
+function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null, quiet = false, reason = null } = {}) {
   if (source !== 'safety check') markActivity();
   if (!state.autolockEnabled) { alEvent('ignored', `away from ${source}: auto-lock disabled`); return { phase: 'disabled' }; }
   if (state.pausedUntil > Date.now()) { alEvent('ignored', `away from ${source}: paused`); return { phase: 'paused', pausedUntil: new Date(state.pausedUntil).toISOString() }; }
@@ -334,7 +343,8 @@ function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null
   AL.phase = 'pending';
   AL.source = source;
   AL.checkFirst = checkFirst; // per-event override of state.checkFirst (null = use the setting)
-  AL.quiet = quiet;           // the phone shows the result itself; ntfy only for problems
+  AL.quiet = quiet;           // the phone shows the result too; skip the "armed, cancel?" message
+  AL.reason = reason || REASONS[source] || source;
   AL.nonce = crypto.randomBytes(16).toString('hex');
   AL.locksAt = Date.now() + graceSec * 1000;
   AL.timer = setTimeout(() => alCheck(), graceSec * 1000);
@@ -392,8 +402,8 @@ async function alCheck() {
   AL.phase = 'checking';
   AL.attempt += 1;
   const attempt = AL.attempt;
-  // Quiet = the phone shows the result itself. But if we told ntfy about a delay, also tell it how it ended.
-  const quietNote = (n) => { if (!AL.quiet || AL.delayNotified) notify(n); };
+  const why = () => AL.reason || AL.source;
+  const waited = () => (AL.delayNotified ? ' It waited a moment because Hyundai was busy.' : '');
   const cancelled = () => { if (!AL.cancelled) return false; alFinish('cancelled', 'back near the car'); alReset(); return true; };
   try {
     if (attempt === 1 && !(AL.checkFirst ?? state.checkFirst)) {
@@ -402,7 +412,7 @@ async function alCheck() {
       if (r.status === 'success') {
         alEvent('locked', `via ${AL.source} (fast)`);
         alFinish('locked');
-        quietNote({ title: 'Car locked', message: `Locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
+        notify({ title: 'Car locked', message: `Locked at ${hhmm(Date.now())} because ${why()}.${waited()}`, priority: 'default', tags: ['lock', 'car'] });
         alReset();
         return;
       }
@@ -415,14 +425,14 @@ async function alCheck() {
     if (s.engine) {
       alEvent('skipped', 'car is on');
       alFinish('car-on');
-      quietNote({ title: 'Auto-lock: car is on', message: `Not locking (${AL.source}): the car is switched on.`, priority: 'min', tags: ['car'] });
+      notify({ title: 'Not locked: car is on', message: `Asked to lock because ${why()}, but the car is switched on.`, priority: 'low', tags: ['car'] });
       alReset(); return;
     }
     if (s.doorLock) {
       alEvent('skipped', 'already locked');
       alFinish('already-locked');
       known = { locked: true, at: Date.now() };
-      quietNote({ title: 'Car already locked', message: `You walked away (${AL.source}); it was already locked, so nothing was sent.`, priority: 'min', tags: ['lock', 'car'] });
+      notify({ title: 'Car locked', message: `Already locked at ${hhmm(Date.now())} (checked because ${why()}).`, priority: 'low', tags: ['lock', 'car'] });
       alReset(); return;
     }
 
@@ -449,7 +459,7 @@ async function alCheck() {
     if (r.status === 'success') {
       alEvent('locked', `via ${AL.source}`);
       alFinish('locked');
-      quietNote({ title: 'Car locked', message: `Auto-locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
+      notify({ title: 'Car locked', message: `Locked at ${hhmm(Date.now())} because ${why()}.${waited()}`, priority: 'default', tags: ['lock', 'car'] });
     } else if (r.code === 'RATE_LIMIT') {
       return alDelay(r.until, 'lock refused: Hyundai rate limit');
     } else {
@@ -653,6 +663,7 @@ const ROUTES = [
     if (g !== undefined && g !== null) opts.graceSec = Number(g);
     if (typeof body.checkFirst === 'boolean') opts.checkFirst = body.checkFirst;
     if (body.quiet === true) opts.quiet = true;
+    if (typeof body.reason === 'string' && body.reason.trim()) opts.reason = body.reason.trim().slice(0, 120);
     send(res, 202, alAway(source, opts));
   }],
   ['PUT', /^\/v1\/autolock\/settings$/, 'admin', (req, res, url, body) => {

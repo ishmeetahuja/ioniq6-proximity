@@ -10,6 +10,26 @@ different, in plain words, with an example. Newest first.
 
 ---
 
+## Build 30 — Oct 15, 2026 · app + server
+
+**Every lock tells you why it happened, and every lock shows up in ntfy.**
+
+- **The reason is in every lock message:** the app's pop-up, ntfy, and the home screen.
+  Examples:
+  - At home: **"Car locked. Locked at 5:03 PM because you'd been away from the car for 20 s
+    (home rule)."** Home screen: "Away · Locked at 5:03 PM by home rule".
+  - Away from home: **"…because you walked away: signal -96 dBm (threshold -87)."**
+  - Phone died after parking: **"…because your phone went quiet after you parked."**
+  - Backup check: **"…because the 6-hour backup check found it off and unlocked."**
+- **Every lock now goes to ntfy**, not just problems. Since build 21, normal locks only showed in
+  the app, so ntfy looked like it had stopped working.
+- **If Hyundai made it wait, the message says so:** "It waited a moment because Hyundai was
+  busy."
+
+**Update:** app and server.
+
+---
+
 ## Build 29 — Oct 15, 2026 · app + server
 
 **Clearer messages when a lock has to wait.**
