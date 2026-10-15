@@ -45,6 +45,8 @@ const CFG = {
     retrySec: num(env.AUTOLOCK_RETRY_SECONDS, 30),
     maxAttempts: num(env.AUTOLOCK_MAX_ATTEMPTS, 5),
     rateLimitGiveUpMin: num(env.AUTOLOCK_RATE_LIMIT_GIVE_UP_MINUTES, 45), // keep retrying a refused lock this long
+    rateLimitBackoffSec: num(env.AUTOLOCK_RATE_LIMIT_BACKOFF_SECONDS, 30),
+    rateLimitBackoffMaxSec: num(env.AUTOLOCK_RATE_LIMIT_BACKOFF_MAX_SECONDS, 600),
   },
   guard: {
     intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = off
@@ -87,6 +89,17 @@ const saveState = () => writeJson(STATE_FILE, {
 
 // ---------------------------------------------------------------- BlueLink client (serialized)
 
+// Every request to Hyundai, one line each, kept in the data volume so it survives updates:
+// "2026-10-15T12:32:49.123Z drlck 200". Shown by `install.sh doctor` to see what Hyundai saw.
+const CALL_LOG = path.join(CFG.dataDir, 'hyundai.log');
+function logCall(endpoint, status, code) {
+  const line = `${new Date().toISOString()} ${endpoint} ${status}${code ? ' ' + code : ''}\n`;
+  fs.stat(CALL_LOG, (err, st) => {
+    if (!err && st.size > 512 * 1024) { try { fs.renameSync(CALL_LOG, CALL_LOG + '.1'); } catch {} }
+    fs.appendFile(CALL_LOG, line, { mode: 0o600 }, () => {});
+  });
+}
+
 const bl = new BlueLinkCA({
   creds: CFG.creds,
   session: readJson(SESSION_FILE) || {},
@@ -97,6 +110,7 @@ const bl = new BlueLinkCA({
   loginRetrySec: CFG.loginRetrySec,
   debug: env.IONIQ6_DEBUG ? (m) => log('[debug]', m) : null,
   warn: (m) => log('[bluelink]', m),
+  onCall: logCall,
 });
 
 // Hyundai doesn't like concurrent sessions/commands from one device: run one operation at a time.
@@ -216,7 +230,10 @@ function alDelay(untilIso, why) {
     alReset();
     return;
   }
-  const at = Math.max(Date.parse(untilIso || '') || 0, Date.now() + 5000) + 3000;
+  // Back off between tries (30 s, 1, 2, 4, 8, 10 min…) so retries never prolong Hyundai's block.
+  AL.delays = (AL.delays || 0) + 1;
+  const backoff = Math.min(CFG.autolock.rateLimitBackoffMaxSec, CFG.autolock.rateLimitBackoffSec * 2 ** (AL.delays - 1)) * 1000;
+  const at = Math.max(Date.parse(untilIso || '') || 0, Date.now() + backoff) + 3000;
   AL.attempt = Math.max(0, AL.attempt - 1);   // a refused request isn't a real attempt
   AL.phase = 'delayed';
   AL.locksAt = at;
@@ -234,7 +251,7 @@ function alEvent(type, detail) {
 }
 function alReset() {
   clearTimeout(AL.timer);
-  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, quiet: false, delayStarted: 0, delayNotified: false });
+  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, quiet: false, delayStarted: 0, delayNotified: false, delays: 0 });
 }
 function alPublic() {
   return {

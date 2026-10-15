@@ -289,6 +289,28 @@ doctor() {
     echo "  note  before the last restart the server ran out of memory"
   fi
 
+  say "Hyundai"
+  local auth until calls since last
+  auth=$(api GET /v1/auth 2>/dev/null)
+  if echo "$auth" | grep -q '"loggedIn": true'; then pass "signed in to BlueLink"
+  else fail "not signed in to BlueLink right now (it signs in again by itself; if this stays, run: bash install.sh login)"; fi
+  until=$(echo "$auth" | sed -n 's/.*"rateLimitedUntil": "\([^"]*\)".*/\1/p')
+  if [ -n "$until" ]; then
+    echo "  note  Hyundai is rate-limiting this server; ordinary requests pause until $(date -d "$until" '+%-I:%M %p' 2>/dev/null || echo "$until")."
+    echo "        Walk-away locks still retry on their own."
+  fi
+  calls=$(docker compose exec -T api sh -c 'cat /data/hyundai.log.1 /data/hyundai.log 2>/dev/null' 2>/dev/null)
+  if [ -n "$calls" ]; then
+    since=$(date -u -d '-24 hours' +%FT%T 2>/dev/null || echo 0)
+    echo "  Requests to Hyundai in the last 24 h (endpoint, count):"
+    echo "$calls" | awk -v s="$since" '$1 >= s { n[$2]++; if ($3 == 429) r[$2]++ }
+      END { for (e in n) printf "        %-26s %4d%s\n", e, n[e], (r[e] ? "   (" r[e] " refused: rate limit)" : "") }' | sort -k2 -nr
+    last=$(echo "$calls" | awk '$3 == 429 { t = $1 } END { print t }')
+    [ -n "$last" ] && echo "  last rate limit: $(date -d "$last" '+%b %-d, %-I:%M %p' 2>/dev/null || echo "$last")"
+  else
+    echo "  (no record of Hyundai requests yet; it starts with this version)"
+  fi
+
   say "What to do"
   if [ "$fails" -eq 0 ]; then
     echo "  Everything checks out from the server. If the phone still can't connect, open"

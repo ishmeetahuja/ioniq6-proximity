@@ -65,7 +65,7 @@ class BlueLinkCA {
    * @param {(msg)=>void} [o.debug]
    * @param {number} [o.pollMs]        delay between action-status polls (default 5000)
    */
-  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs, minCooldownSec, loginRetrySec } = {}) {
+  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs, minCooldownSec, loginRetrySec, onCall } = {}) {
     if (!creds?.username || !creds?.password || !creds?.pin) {
       throw new BlueLinkError('BlueLink username, password and PIN are all required.', 'INPUT');
     }
@@ -77,6 +77,7 @@ class BlueLinkCA {
     this.debug = debug || null;
     this.warn = warn || ((m) => console.warn(`[bluelink] ${m}`));
     this.pollMs = pollMs || 5000;
+    this.onCall = onCall || null;   // (endpoint, httpStatus | 'network', errorCode) after every request
     // Back-off: Hyundai sits behind Cloudflare, which bans an IP that keeps knocking.
     this.minCooldownMs = (minCooldownSec ?? 600) * 1000;   // after a 429, stay away at least this long
     this.loginRetryMs = (loginRetrySec ?? 300) * 1000;     // after a failed sign-in, wait before the next
@@ -165,6 +166,7 @@ class BlueLinkCA {
         const text = await res.text();
         let json;
         try { json = JSON.parse(text); } catch { json = undefined; }
+        try { this.onCall?.(endpoint, res.status, json?.error?.errorCode); } catch {}
         if (res.status === 429) {
           const ra = (json && (json.retry_after ?? json.retryAfter)) || res.headers.get('retry-after');
           if (json) this.warn(`${endpoint}: unexpected reply (HTTP 429) ${BlueLinkCA.mask(json).slice(0, 500)}`);
@@ -185,6 +187,7 @@ class BlueLinkCA {
       } catch (e) {
         if (e instanceof BlueLinkError) throw e;
         lastErr = e;
+        try { this.onCall?.(endpoint, 'network', null); } catch {}
         if (this.debug) this.debug(`${endpoint} network error: ${e.message}; retrying`);
         await sleep(delay);
       }
