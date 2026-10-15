@@ -66,6 +66,7 @@ class MainActivity : Activity() {
     private lateinit var findCard: Card
     private lateinit var runSwitch: Switch
     private lateinit var modeWord: TextView
+    private lateinit var armedBadge: TextView
     private lateinit var modeWhy: TextView
     private lateinit var meter: SignalMeterView
     private lateinit var pauseBtn: TextView
@@ -326,6 +327,7 @@ class MainActivity : Activity() {
             contentDescription = "Walk-away lock"
             setOnCheckedChangeListener { _, on -> if (on) startMonitoring() else stopMonitoring() }
         }
+        armedBadge = chip()
         modeWord = text("", 28f, Ui.TEXT, Ui.display)
         modeWhy = text("", 14f, Ui.MUTED).apply { setLineSpacing(0f, 1.2f) }
         meter = SignalMeterView(this)
@@ -337,7 +339,8 @@ class MainActivity : Activity() {
                 addView(text("Walk-away lock", 17f, Ui.TEXT, Ui.semibold), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
                 addView(runSwitch)
             })
-            addView(modeWord, Ui.lp(top = dp(12)))
+            addView(armedBadge, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(12) })
+            addView(modeWord, Ui.lp(top = dp(10)))
             addView(modeWhy, Ui.lp(top = dp(6)))
             addView(meter, Ui.lp(top = dp(16)))
             addView(LinearLayout(context).apply {
@@ -456,10 +459,13 @@ class MainActivity : Activity() {
             !Status.autolockEnabled -> "Off on the server" to "Turn it back on in the server settings."
             Status.mode.startsWith("Driving") -> "Driving" to "Watches again when you park."
             Status.mode.startsWith("Parked") -> "Parked, watching" to "Locks when the tag's signal drops below $thr dBm."
-            Status.mode.startsWith("Away") -> "Away" to "You walked off; the car was told to lock."
+            Status.mode.startsWith("Away") -> "Away" to "Lock sent when you walked off (if it was already locked, ntfy says so). Arms again after 30 s right by the car, or when you park."
             Status.mode.startsWith("At home") -> "At home" to "Locks once each time you've been at the car and then left it for ${prefs.homeDelaySec} s. Walking around the house doesn't count."
             else -> "Waiting for the car" to "Arms when you finish a drive, or after 30 s right by the car."
         }
+        val armed = Status.running && paused == null && Status.autolockEnabled &&
+            (Status.mode.startsWith("Parked") || Status.mode.startsWith("At home"))
+        armedBadge.setChip(if (armed) "ARMED" else "NOT ARMED", if (armed) Ui.GLACIER else Ui.MUTED)
         modeWord.text = word
         modeWord.setTextColor(if (paused != null) Ui.AMBER else Ui.TEXT)
         modeWhy.text = why

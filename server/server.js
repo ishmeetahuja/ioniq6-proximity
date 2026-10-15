@@ -286,8 +286,17 @@ async function alCheck() {
 
     const s = await withCar(() => bl.rawStatus({ refresh: true }));
     if (AL.cancelled) { alReset(); return; }
-    if (s.engine) { alEvent('skipped', 'car is on'); alReset(); return; }
-    if (s.doorLock) { alEvent('skipped', 'already locked'); alReset(); return; }
+    // Say so quietly, so a skipped lock never looks like auto-lock didn't work.
+    if (s.engine) {
+      alEvent('skipped', 'car is on');
+      notify({ title: 'Auto-lock: car is on', message: `Not locking (${AL.source}): the car is switched on.`, priority: 'min', tags: ['car'] });
+      alReset(); return;
+    }
+    if (s.doorLock) {
+      alEvent('skipped', 'already locked');
+      notify({ title: 'Car already locked', message: `You walked away (${AL.source}); it was already locked, so nothing was sent.`, priority: 'min', tags: ['lock', 'car'] });
+      alReset(); return;
+    }
 
     const open = describeOpen(s);
     if (open.length) {

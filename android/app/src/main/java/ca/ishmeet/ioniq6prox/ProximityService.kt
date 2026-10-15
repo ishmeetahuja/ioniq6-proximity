@@ -714,7 +714,12 @@ class ProximityService : Service() {
         val actionPi = PendingIntent.getService(this, 1, action, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentTitle("IONIQ 6 auto-lock")
+            .setContentTitle(when {
+                paused -> "Not armed · paused"
+                mode == Mode.PARKED -> "Armed · locks when you walk away"
+                mode == Mode.HOME -> "Armed (home) · locks once after each visit"
+                else -> "Not armed · ${mode.label.lowercase()}"
+            })
             .setContentText(text)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
