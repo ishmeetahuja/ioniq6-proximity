@@ -181,6 +181,8 @@ class ProximityService : Service() {
         registerWifiWatch()
         connectTag(direct = false)
         checkCarAlreadyConnected()
+        // No "connected" answer within a few seconds → the car isn't being driven with this phone.
+        handler.postDelayed({ if (Status.carConnected != true && mode != Mode.DRIVING) notDrivingAtStart() }, 4_000)
         handler.post(tick)
         Status.log("Monitoring started")
     }
@@ -272,8 +274,18 @@ class ProximityService : Service() {
 
     private fun onCarDisconnected() {
         Status.carConnected = false
-        prefs.carOffAt = now(); Status.changed()
+        prefs.carOffAt = now(); prefs.carOffAtStartup = false; Status.changed()
         arm("car Bluetooth disconnected")
+    }
+
+    /** Started (or restarted) while not connected to the car: record that it isn't being driven. */
+    private fun notDrivingAtStart() {
+        Status.carConnected = false
+        if (prefs.carOffAt > 0 && prefs.carOffAt > prefs.carOnAt) return   // already know it's parked
+        prefs.carOffAt = now()
+        prefs.carOffAtStartup = true
+        Status.changed()
+        Status.log("Not connected to the car's Bluetooth: treating it as parked")
     }
 
     private fun arm(why: String) {

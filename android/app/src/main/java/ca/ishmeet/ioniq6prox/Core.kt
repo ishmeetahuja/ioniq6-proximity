@@ -90,6 +90,14 @@ class Prefs(c: Context) {
     var carOffAt: Long
         get() = sp.getLong("carOffAt", 0L)
         set(v) { sp.edit().putLong("carOffAt", v).apply() }
+    /** carOffAt came from "not connected when monitoring started", not from seeing a disconnect. */
+    var carOffAtStartup: Boolean
+        get() = sp.getBoolean("carOffStartup", false)
+        set(v) { sp.edit().putBoolean("carOffStartup", v).apply() }
+    /** Last automatic live refresh (asks the car itself), so it happens at most every half hour. */
+    var lastLiveAt: Long
+        get() = sp.getLong("lastLiveAt", 0L)
+        set(v) { sp.edit().putLong("lastLiveAt", v).apply() }
     /** Last lock/unlock the server confirmed for us (walk-away or the buttons). */
     var lockConfirmedAt: Long
         get() = sp.getLong("lockAt", 0L)

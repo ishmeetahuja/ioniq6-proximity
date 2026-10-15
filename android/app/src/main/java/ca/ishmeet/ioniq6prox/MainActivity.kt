@@ -77,6 +77,7 @@ class MainActivity : Activity() {
     private var carError: String? = null
     private var busy = false            // one car command at a time
     private var lastAttemptAt = 0L
+    private var refreshProblem: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -122,6 +123,18 @@ class MainActivity : Activity() {
     private fun maybeRefresh() {
         if (!prefs.configured) return
         val now = System.currentTimeMillis()
+        // Ask the car itself (wakes it) when what we have is clearly out of date: nothing yet,
+        // Hyundai's copy is older than your last drive/park, or older than 6 hours. At most every
+        // 30 minutes, so it can't wear on the 12 V battery or Hyundai's limits.
+        val c = car
+        val age = c?.updated?.let { now - utcMillis(it) } ?: Long.MAX_VALUE
+        val outOfDate = c == null || stale(c) || age > 6 * 3_600_000L
+        if (outOfDate && now - prefs.lastLiveAt > 30 * 60_000L && now - lastAttemptAt > 60_000L) {
+            lastAttemptAt = now
+            prefs.lastLiveAt = now
+            loadStatus(live = true, auto = true)
+            return
+        }
         val every = prefs.statusEveryMin
         if (every == 0 && car != null) return
         val gap = (if (every == 0) 1 else every) * 60_000L
@@ -380,8 +393,9 @@ class MainActivity : Activity() {
         subtitle.visibility = if (subtitle.text.isNullOrBlank()) View.GONE else View.VISIBLE
 
         val (word, color, why) = truth(c)
-        note.text = why ?: ""
-        note.visibility = if (why.isNullOrBlank()) View.GONE else View.VISIBLE
+        val lines = listOfNotNull(why, refreshProblem)
+        note.text = lines.joinToString("\n")
+        note.visibility = if (lines.isEmpty()) View.GONE else View.VISIBLE
         stateWord.text = word
         stateWord.setTextColor(if (color == Ui.FAINT) Ui.MUTED else color)
         art.glowColor = color
@@ -434,7 +448,9 @@ class MainActivity : Activity() {
                     (if (locked) "Locked" else "Unlocked") + " at ${clock(lockAt)}" + (if (by.isNotBlank()) " by $by" else ""))
             c == null -> Triple(if (carError != null) "No contact" else if (prefs.configured) "Checking…" else "Not set up", Ui.FAINT, null)
             // you parked after Hyundai's data was taken, so "car on"/"locked" from it is out of date
-            offAt > upd && offAt >= onAt -> Triple("Parked", Ui.TEXT, "Parked at ${clock(offAt)}. Not locked by the app yet")
+            offAt > upd && offAt >= onAt -> Triple("Parked", Ui.TEXT,
+                if (prefs.carOffAtStartup) "Your phone isn't connected to the car, so it's not being driven. Lock state not confirmed yet"
+                else "Parked at ${clock(offAt)}. Lock state not confirmed yet")
             c.carOn -> Triple("Car on", Ui.GLACIER, null)
             c.locked == true -> Triple("Locked", Ui.GLACIER, null)
             c.locked == false -> Triple("Unlocked", Ui.AMBER, null)
@@ -552,15 +568,20 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ car
 
-    private fun loadStatus(live: Boolean) {
+    private fun loadStatus(live: Boolean, auto: Boolean = false) {
         if (!prefs.configured) return
         if (live) updated.text = "Asking the car…"
         io.execute {
             try {
                 val s = CarApi.status(prefs, live)
-                runOnUiThread { car = s; carError = null; renderCar() }
+                runOnUiThread { car = s; carError = null; refreshProblem = null; renderCar() }
             } catch (e: CarApi.Failure) {
-                runOnUiThread { if (car == null) carError = e.message; renderCar(); if (live) bar.show(e.message ?: "", Ui.CORAL) }
+                runOnUiThread {
+                    if (car == null) carError = e.message
+                    if (live) refreshProblem = "Couldn't ask the car: ${e.message}"
+                    renderCar()
+                    if (live && !auto) bar.show(e.message ?: "", Ui.CORAL, 6_000)
+                }
             } catch (e: Exception) {
                 runOnUiThread { carError = "Couldn't read the car's status"; renderCar() }
             }
