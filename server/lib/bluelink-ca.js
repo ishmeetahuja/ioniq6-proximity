@@ -120,12 +120,18 @@ class BlueLinkCA {
     return t > Date.now() ? new Date(t).toISOString() : null;
   }
 
-  coolDown(seconds, why) {
+  coolDown(seconds, why, { escalate = 0 } = {}) {
     // Two clocks: Cloudflare's own wait (retry_after, at least 30 s), and our longer, polite pause
     // for everything that can wait. A lock (urgent) only has to respect the first.
-    const hard = Math.max(Math.min(30_000, this.minCooldownMs), (Number(seconds) || 0) * 1000);
+    // escalate = how many times in a row this was refused: each refusal doubles both pauses
+    // (polite: 10, 20, 40, 80, 120 min; urgent: 30 s … 15 min), because knocking again while
+    // Cloudflare is still blocking us only keeps the block going.
+    const k = escalate > 1 ? 2 ** Math.min(escalate - 1, 6) : 1;
+    const hardFloor = Math.min(30_000, this.minCooldownMs);
+    const hard = Math.max(Math.min(hardFloor * k, 15 * 60_000), (Number(seconds) || 0) * 1000);
+    const soft = Math.max(Math.min(this.minCooldownMs * k, 12 * this.minCooldownMs), hard);
     this.session.hardCooldownUntil = Date.now() + hard;
-    this.session.cooldownUntil = Date.now() + Math.max(this.minCooldownMs, hard);
+    this.session.cooldownUntil = Date.now() + soft;
     this.save();
     this.warn(`${why}: not contacting Hyundai until ${new Date(this.session.cooldownUntil).toISOString()} (locks may retry after ${new Date(this.session.hardCooldownUntil).toISOString()})`);
   }
@@ -170,7 +176,8 @@ class BlueLinkCA {
         if (res.status === 429) {
           const ra = (json && (json.retry_after ?? json.retryAfter)) || res.headers.get('retry-after');
           if (json) this.warn(`${endpoint}: unexpected reply (HTTP 429) ${BlueLinkCA.mask(json).slice(0, 500)}`);
-          this.coolDown(ra, `${endpoint}: rate-limited by Hyundai (HTTP 429)`);
+          const refusals = endpoint === 'v2/login' ? (this.session.loginRefusals = (this.session.loginRefusals || 0) + 1) : 0;
+          this.coolDown(ra, `${endpoint}: rate-limited by Hyundai (HTTP 429${refusals ? `, sign-in refused ${refusals}× in a row` : ''}; retry_after ${ra ?? 'not given'})`, { escalate: refusals });
           throw this.rateLimitError(this.blockedUntil() || this.session.cooldownUntil);
         }
         if (json === undefined) {
@@ -303,7 +310,10 @@ class BlueLinkCA {
   storeToken(tok) {
     this.session.accessToken = tok.accessToken;
     this.session.expiresAt = Date.now() + (Number(tok.expireIn) - 60) * 1000;
+    this.session.signedInAt = Date.now();
+    delete this.session.loginRefusals;
     this.save();
+    this.warn(`signed in; Hyundai says this sign-in lasts ${Math.round(Number(tok.expireIn) / 60)} min`);
   }
 
   /** We hold a session token. (Whether Hyundai still accepts it is only known by using it.) */
@@ -352,6 +362,8 @@ class BlueLinkCA {
     });
     let res = await go();
     if (res.json.responseHeader?.responseCode === 1 && AUTH_ERRORS.has(String(res.json.error?.errorCode))) {
+      const age = this.session.signedInAt ? Math.round((Date.now() - this.session.signedInAt) / 60000) : null;
+      this.warn(`Hyundai ended the sign-in (${res.json.error?.errorCode})${age !== null ? ` after ${age} min` : ''}; signing in again`);
       await this.relogin();
       res = await go();
     }
