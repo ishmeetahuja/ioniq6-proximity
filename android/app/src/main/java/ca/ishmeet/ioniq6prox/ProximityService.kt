@@ -22,6 +22,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.location.LocationListener
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -99,6 +101,11 @@ class ProximityService : Service() {
         private const val HOME_DETECT_MS = 2 * 60_000L // after parking, look for "home" this long
         private const val LOCATE_RETRY_MS = 20_000L
         private const val VISIT_MS = 5_000L            // at the car this long = a visit
+        private const val HERE_EVERY_MS = 2 * 60_000L  // "still here" to the server while near the car
+        private const val MOVING_MPS = 2.8f            // > 10 km/h …
+        private const val MOVING_HOLD_MS = 8_000L      // … for 8 s = driving
+        private const val STILL_MPS = 1.4f             // < 5 km/h …
+        private const val STILL_HOLD_MS = 20_000L      // … for 20 s = standing still
         private const val HOME_RECHECK_MS = 60_000L
 
         fun hasPermissions(c: Context): Boolean {
@@ -159,6 +166,10 @@ class ProximityService : Service() {
     private var visiting = false          // at home: a visit is open; lock once you've left the car
     private var visitIsParking = false    // the open visit is the one that started with parking
     private var homeCachedAt = 0L
+    private var lastHereAt = 0L
+    private var motionListener: LocationListener? = null
+    private var fastSince = 0L
+    private var slowSince = 0L
     private var homeCached: Boolean? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -202,6 +213,7 @@ class ProximityService : Service() {
         stopScan()
         try { unregisterReceiver(aclReceiver) } catch (_: Exception) {}
         try { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(wifiCb) } catch (_: Exception) {}
+        stopMotionWatch()
         try { gatt?.close() } catch (_: SecurityException) {}
         gatt = null
         if (::net.isInitialized) net.shutdown()
@@ -264,6 +276,7 @@ class ProximityService : Service() {
 
     private fun onCarConnected() {
         Status.carConnected = true
+        startMotionWatch()
         prefs.carOnAt = now(); Status.changed()
         homeCheckUntil = 0
         stopScan()
@@ -274,6 +287,7 @@ class ProximityService : Service() {
 
     private fun onCarDisconnected() {
         Status.carConnected = false
+        stopMotionWatch()
         prefs.carOffAt = now(); prefs.carOffAtStartup = false; Status.changed()
         arm("car Bluetooth disconnected")
     }
@@ -301,11 +315,54 @@ class ProximityService : Service() {
         linkDownSince = if (espConnected) 0 else now()
         setMode(Mode.PARKED, why)
         if (!espConnected) startScan()
+        // Tell the server we parked. If the phone then goes quiet (dead, killed, no signal) without
+        // a lock, the server locks on its own after a few minutes.
+        send("/v1/autolock/parked", """{"source":"car-bluetooth"}""", "parked")
+        lastHereAt = parkedAt
         if (Home.enabled(prefs)) {
             homeCheckUntil = parkedAt + HOME_DETECT_MS
             nextLocateAt = parkedAt
             checkHome(parkedAt)
         } else homeCheckUntil = 0
+    }
+
+    // ------------------------------------------------------------------ driving vs standing (GPS)
+
+    /** GPS only while connected to the car, so it costs almost nothing. */
+    private fun startMotionWatch() {
+        if (motionListener != null) return
+        if (!Home.hasLocation(this)) { Status.moving = null; return }
+        val lm = getSystemService(LocationManager::class.java) ?: return
+        val provider = listOf(LocationManager.GPS_PROVIDER, LocationManager.FUSED_PROVIDER)
+            .firstOrNull { try { lm.isProviderEnabled(it) } catch (_: Exception) { false } } ?: return
+        val l = LocationListener { loc -> if (loc.hasSpeed()) handler.post { onSpeed(loc.speed) } }
+        try {
+            lm.requestLocationUpdates(provider, 3_000L, 0f, l, Looper.getMainLooper())
+            motionListener = l
+            fastSince = 0; slowSince = 0
+        } catch (e: SecurityException) { Status.moving = null }
+    }
+
+    private fun stopMotionWatch() {
+        motionListener?.let { l -> try { getSystemService(LocationManager::class.java)?.removeUpdates(l) } catch (_: Exception) {} }
+        motionListener = null
+        if (Status.moving != null) { Status.moving = null; Status.changed() }
+    }
+
+    private fun onSpeed(mps: Float) {
+        val t = now()
+        when {
+            mps > MOVING_MPS -> {
+                slowSince = 0
+                if (fastSince == 0L) fastSince = t
+                if (t - fastSince >= MOVING_HOLD_MS && Status.moving != true) { Status.moving = true; Status.changed(); Status.log("Moving: driving") }
+            }
+            mps < STILL_MPS -> {
+                fastSince = 0
+                if (slowSince == 0L) slowSince = t
+                if (t - slowSince >= STILL_HOLD_MS && Status.moving != false) { Status.moving = false; Status.changed(); Status.log("Standing still (in the car)") }
+            }
+        }
     }
 
     // ------------------------------------------------------------------ home
@@ -557,6 +614,12 @@ class ProximityService : Service() {
         val atCar = espConnected && s != null && s >= prefs.atCarRssi
         if (atCar) lastAtCarAt = t
         if (homeCheckUntil > 0) checkHome(t)
+        // Near the car after parking: tell the server "still here" now and then, so its
+        // dead-man's switch only fires if the phone really goes quiet.
+        if (mode != Mode.DRIVING && mode != Mode.UNKNOWN && espConnected && s != null && s >= threshold && t - lastHereAt > HERE_EVERY_MS) {
+            lastHereAt = t
+            here()
+        }
 
         when (mode) {
             Mode.PARKED -> {
@@ -702,13 +765,21 @@ class ProximityService : Service() {
 
     private fun lockResult(gen: Int, outcome: String, detail: String?) {
         when (outcome) {
-            "locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "Locked as you walked away", problem = false) }
-            "already-locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "It was already locked", problem = false) }
+            "locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "Locked as you walked away", problem = false); readSavedSoon() }
+            "already-locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "It was already locked", problem = false); readSavedSoon() }
             "car-on" -> lockDone(gen, "Not locked: the car is on", null, problem = false, quiet = true)
             "cancelled" -> lockDone(gen, "Lock cancelled", "You came back to the car", problem = false, quiet = true)
             "open" -> lockDone(gen, "Car NOT locked", "${detail ?: "Something is open"}. Close it and lock it.", problem = true)
             else -> lockDone(gen, "Car NOT locked", detail ?: "The lock didn't go through. Lock it yourself.", problem = true)
         }
+    }
+
+    /** A minute after a lock, read Hyundai's saved copy (doesn't wake the car): it has usually caught up by then. */
+    private fun readSavedSoon() {
+        handler.postDelayed({
+            if (!prefs.configured) return@postDelayed
+            net.execute { try { CarApi.status(prefs); Status.changed() } catch (_: Exception) {} }
+        }, 60_000)
     }
 
     private fun lockDone(gen: Int, title: String, text: String?, problem: Boolean, quiet: Boolean = false) {
@@ -795,6 +866,12 @@ class ProximityService : Service() {
             Status.log("$label gave up after 12 tries")
             if (critical) handler.post { lockDone(gen, "Car NOT locked", "Couldn't reach the server. Lock the car yourself.", problem = true) }
         }
+    }
+
+    /** One quick "still here", no retries: the next one comes in two minutes anyway. */
+    private fun here() {
+        if (!prefs.configured) return
+        Thread { try { Api.request(prefs, "POST", "/v1/autolock/here", "{}") } catch (_: Exception) {} }.start()
     }
 
     /** Confirms the server and token work, and picks up the pause state. */

@@ -191,24 +191,7 @@ class SettingsActivity : Activity() {
             addView(row(dp(10), pillButton("Save") { saveHome() }, pillButton("Am I home?", Ui.GLACIER, Ui.ON_ACCENT) { checkHomeNow() }), Ui.lp(top = dp(16)))
         }
 
-        section(col, "Car status updates", "How often the home screen reads Hyundai's saved copy of the car's status while the app is open (this doesn't wake the car; the server also shares one read for 5 minutes). Asking the car itself happens when you tap Refresh, and automatically only a few times a day, never overnight.") {
-            val opts = listOf(5, 15, 30, 60)
-            val pills = opts.map { m -> pillButton("$m min") {} }
-            val manual = pillButton("Only when I tap Refresh") {}
-            fun paint() {
-                fun style(b: TextView, sel: Boolean) {
-                    b.background = Ui.run { this@SettingsActivity.pressable(if (sel) alpha(GLACIER, 0.16f) else RAISED, dpf(999f), stroke = if (sel) dp(1) else 0, strokeColor = GLACIER) }
-                    b.setTextColor(if (sel) Ui.GLACIER else Ui.TEXT)
-                }
-                pills.forEachIndexed { i, b -> style(b, prefs.statusEveryMin == opts[i]) }
-                style(manual, prefs.statusEveryMin == 0)
-            }
-            pills.forEachIndexed { i, b -> b.setOnClickListener { prefs.statusEveryMin = opts[i]; paint(); bar.show("Every ${opts[i]} min while the app is open", Ui.GLACIER) } }
-            manual.setOnClickListener { prefs.statusEveryMin = 0; paint(); bar.show("Only when you tap Refresh", Ui.GLACIER) }
-            paint()
-            addView(row(dp(8), *pills.toTypedArray()), Ui.lp(top = dp(14)))
-            addView(manual, Ui.lp(top = dp(8)))
-        }
+        section(col, "Car status updates", "Lock state, driving and parked come from your phone (car Bluetooth, GPS, the ESP32) and from confirmed locks, so they're always current. Battery, range and climate come from Hyundai: the app reads Hyundai's saved copy at most twice an hour and a minute after each lock (neither wakes the car). It asks the car itself when you tap Refresh, and on its own only a few times a day when the data is clearly out of date, never overnight.") {}
 
         section(col, "Background and testing") {
             item("Battery", "Allow") { askBatteryExemption() }.text = "Let it keep watching while the screen is off"

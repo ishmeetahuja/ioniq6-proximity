@@ -71,9 +71,8 @@ class Prefs(c: Context) {
         set(v) { sp.edit().putInt("homeDelay", v).apply() }
 
     /** Car status on the home screen: refresh at most every N minutes (0 = only when I tap). */
-    var statusEveryMin: Int
-        get() = sp.getInt("statusEvery", 15).let { if (it in 1..4) 5 else it }
-        set(v) { sp.edit().putInt("statusEvery", v).apply() }
+    /** Fixed: the app reads Hyundai's saved copy at most twice an hour on its own. */
+    val statusEveryMin: Int get() = 30
     /** The last status the server sent, and when we got it, so a restart doesn't ask again. */
     var lastStatusJson: String?
         get() = sp.getString("lastStatus", null)
@@ -149,6 +148,8 @@ object Status {
     @Volatile var rssi: Int? = null      // smoothed
     @Volatile var rawRssi: Int? = null
     @Volatile var carConnected: Boolean? = null
+    /** From GPS, only while connected to the car: true = moving (driving), false = standing still, null = unknown. */
+    @Volatile var moving: Boolean? = null
     @Volatile var serverProblem: String? = null   // null = last contact worked
     @Volatile var pausedUntil: String? = null     // ISO time from the server, null = not paused
     @Volatile var autolockEnabled: Boolean = true

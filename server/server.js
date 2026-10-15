@@ -58,10 +58,15 @@ const CFG = {
     rateLimitBackoffMaxSec: num(env.AUTOLOCK_RATE_LIMIT_BACKOFF_MAX_SECONDS, 600),
   },
   guard: {
-    intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = off; how often while the car is in use
-    idleMin: num(env.GUARD_IDLE_MINUTES, 360),       // how often when nothing has happened for a while
-    activeHours: num(env.GUARD_ACTIVE_HOURS, 3),     // "in use" = within this long of a drive/park/command
+    intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = backup check off (any other value = on)
+    everyHours: num(env.GUARD_EVERY_HOURS, 6),       // how often the backup check looks
     graceSec: num(env.GUARD_GRACE_SECONDS, 60),
+  },
+  // Dead-man's switch: after the phone says "parked", it keeps saying "still here" while you're
+  // near the car. If it goes silent this long without a lock, the server locks on its own.
+  watch: {
+    silentMin: num(env.WATCH_SILENT_MINUTES, 10),
+    nearMin: num(env.PHONE_NEAR_MINUTES, 15),        // "the phone said it's at the car" counts this long
   },
   ntfy: { url: env.NTFY_URL || '', token: env.NTFY_TOKEN || '' },
   telegram: { token: env.TELEGRAM_BOT_TOKEN || '', chat: env.TELEGRAM_CHAT_ID || '' },
@@ -94,10 +99,12 @@ const state = Object.assign({
   autolockEnabled: CFG.autolock.enabled, pausedUntil: 0,
   graceSec: CFG.autolock.graceSec, checkFirst: CFG.autolock.checkFirst,
   wakeups: [],        // [{ t, ep, auto }] for the last 24 h: every time we made Hyundai contact the car
+  watch: { armedAt: 0, lastSeen: 0 },   // dead-man's switch (see CFG.watch)
+  lastNearAt: 0,      // last time the phone said it's at / in the car
 }, readJson(STATE_FILE) || {});
 const saveState = () => writeJson(STATE_FILE, {
   autolockEnabled: state.autolockEnabled, pausedUntil: state.pausedUntil, graceSec: state.graceSec, checkFirst: state.checkFirst,
-  wakeups: state.wakeups,
+  wakeups: state.wakeups, watch: state.watch, lastNearAt: state.lastNearAt,
 });
 
 // ---------------------------------------------------------------- car wake-up budget
@@ -312,7 +319,8 @@ function alPublic() {
     attempt: AL.attempt || undefined,
     graceSeconds: state.graceSec,
     checkFirst: state.checkFirst,
-    guardMinutes: CFG.guard.intervalMin || 0,
+    backupCheckEveryHours: CFG.guard.intervalMin > 0 ? CFG.guard.everyHours : 0,
+    watching: state.watch.armedAt ? { since: new Date(state.watch.armedAt).toISOString(), lastSeen: new Date(state.watch.lastSeen).toISOString() } : null,
     events: AL.events.slice(0, 20),
   };
 }
@@ -345,6 +353,8 @@ function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null
 
 function alNear(source = 'phone') {
   markActivity();
+  watchSeen();
+  if (source === 'car-bluetooth') watchOff('driving');
   if (AL.phase === 'pending' || AL.phase === 'retrying' || AL.phase === 'delayed') {
     alEvent('cancelled', `back near the car (${source})`);
     alFinish('cancelled', 'back near the car');
@@ -470,20 +480,23 @@ async function alCheck() {
 let lastActivity = 0;
 let lastGuardAt = Date.now();      // no check right at start-up
 function markActivity() { lastActivity = Date.now(); }
-function guardDue() {
-  const active = Date.now() - lastActivity < CFG.guard.activeHours * 3600e3 || AL.guardUnlockedSince;
-  return Date.now() - lastGuardAt >= (active ? CFG.guard.intervalMin : CFG.guard.idleMin) * 60000;
+function guardDue() { return Date.now() - lastGuardAt >= CFG.guard.everyHours * 3600e3; }
+/** Why the backup check should leave Hyundai alone right now, or null. */
+function guardSkip() {
+  if (!state.autolockEnabled || state.pausedUntil > Date.now() || AL.phase !== 'idle') return 'auto-lock off, paused or busy';
+  if (known.locked && known.at > lastActivity) return 'a lock was confirmed since the car was last used';
+  if (Date.now() - state.lastNearAt < CFG.watch.nearMin * 60000) return 'the phone says you are at the car';
+  return null;
 }
 async function guardTick() {
-  if (!state.autolockEnabled || state.pausedUntil > Date.now() || AL.phase !== 'idle') return;
-  if (known.locked && known.at > lastActivity) { AL.guardUnlockedSince = null; return; }   // locked since last use
+  const skip = guardSkip();
+  if (skip) { log(`backup check skipped: ${skip}`); return; }
   try {
     const s = await withCar(() => bl.rawStatus({ refresh: false }));
-    if (s.engine || s.doorLock) { AL.guardUnlockedSince = null; return; }
+    if (s.engine || s.doorLock) return;
     // Hyundai's saved copy may predate a lock we confirmed ourselves.
-    if (known.locked && known.at > (Date.parse(parseStamp(s.lastStatusDate) || '') || 0)) { AL.guardUnlockedSince = null; return; }
-    if (!AL.guardUnlockedSince) { AL.guardUnlockedSince = Date.now(); log('guard: car reported unlocked; will act if still unlocked next check'); return; }
-    AL.guardUnlockedSince = null;
+    if (known.locked && known.at > (Date.parse(parseStamp(s.lastStatusDate) || '') || 0)) return;
+    log('backup check: Hyundai says the car is off and unlocked; locking');
     alAway('safety check', { graceSec: CFG.guard.graceSec });
   } catch (e) {
     log('guard error:', e.message);
@@ -652,6 +665,13 @@ const ROUTES = [
     send(res, 200, alPublic());
   }],
   ['POST', /^\/v1\/autolock\/near$/, 'phone', (req, res, url, body) => send(res, 200, alNear(String(body.source || url.searchParams.get('source') || 'phone').slice(0, 40)))],
+  // dead-man's switch: the phone says "parked", then "still here" every couple of minutes near the car
+  ['POST', /^\/v1\/autolock\/parked$/, 'phone', (req, res, url, body) => {
+    markActivity();
+    watchArm(String(body.source || 'phone').slice(0, 40));
+    send(res, 200, alPublic());
+  }],
+  ['POST', /^\/v1\/autolock\/here$/, 'phone', (req, res) => { watchSeen(); send(res, 200, { ok: true, watching: !!state.watch.armedAt }); }],
   ['POST', /^\/v1\/autolock\/cancel$/, 'phone', (req, res) => send(res, 200, { cancelled: alCancel('api'), ...alPublic() })],
   // single-use link from the notification; the nonce is the credential
   [/^(GET|POST)$/, /^\/v1\/autolock\/cancel\/([0-9a-f]{32})$/, 'none', (req, res, url, body, m) => {
@@ -699,14 +719,45 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(CFG.port, CFG.host, () => {
   log(`ioniq6-api ${VERSION} listening on ${CFG.host}:${CFG.port}`);
-  log(`auto-lock ${state.autolockEnabled ? 'on' : 'off'}, grace ${state.graceSec}s, ${state.checkFirst ? 'check first' : 'fast lock'}; safety check ${CFG.guard.intervalMin ? 'every ' + CFG.guard.intervalMin + ' min' : 'off'}; notifications: ${[CFG.ntfy.url && 'ntfy', CFG.telegram.token && 'telegram'].filter(Boolean).join(', ') || 'none'}`);
+  log(`auto-lock ${state.autolockEnabled ? 'on' : 'off'}, grace ${state.graceSec}s, ${state.checkFirst ? 'check first' : 'fast lock'}; backup check ${CFG.guard.intervalMin ? 'every ' + CFG.guard.everyHours + ' h' : 'off'}; locks if the phone goes quiet for ${CFG.watch.silentMin} min after parking; notifications: ${[CFG.ntfy.url && 'ntfy', CFG.telegram.token && 'telegram'].filter(Boolean).join(', ') || 'none'}`);
   if (!CFG.publicUrl) log('PUBLIC_URL not set: notifications will have no "Cancel auto-lock" button');
   if (!bl.loggedIn) log('Not logged in to BlueLink yet: POST /v1/auth/login with the admin token.');
 });
 if (CFG.guard.intervalMin > 0) {
   setInterval(() => { if (guardDue()) { lastGuardAt = Date.now(); guardTick(); } },
-    Math.min(60000, CFG.guard.intervalMin * 60000, CFG.guard.idleMin * 60000)).unref();
+    Math.min(60000, CFG.guard.everyHours * 3600e3)).unref();
 }
+
+// ---------------------------------------------------------------- dead-man's switch
+
+function watchArm(source) {
+  state.watch = { armedAt: Date.now(), lastSeen: Date.now() };
+  saveState();
+  alEvent('watching', `parked (${source}); locks if the phone goes quiet for ${CFG.watch.silentMin} min without a lock`);
+}
+function watchOff(why) {
+  if (!state.watch.armedAt) return;
+  state.watch = { armedAt: 0, lastSeen: 0 };
+  saveState();
+  alEvent('watch-off', why);
+}
+function watchSeen() {
+  state.lastNearAt = Date.now();
+  if (state.watch.armedAt) state.watch.lastSeen = Date.now();
+  saveState();
+}
+function watchTick() {
+  const w = state.watch;
+  if (!w.armedAt) return;
+  if (known.locked && known.at > w.armedAt) return watchOff('lock confirmed');
+  if (Date.now() - w.lastSeen < CFG.watch.silentMin * 60000) return;
+  if (!state.autolockEnabled || state.pausedUntil > Date.now()) return watchOff('auto-lock off or paused');
+  if (AL.phase !== 'idle') return;   // a lock is already on its way; look again next time
+  watchOff('phone went quiet');
+  // Not quiet: the phone may be dead, so this one is announced on ntfy.
+  alAway('phone went quiet', { graceSec: 0 });
+}
+setInterval(watchTick, Math.min(30000, CFG.watch.silentMin * 60000)).unref();
 
 process.on('unhandledRejection', (e) => log('unhandled rejection:', e?.stack || e));
 

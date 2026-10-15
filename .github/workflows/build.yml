@@ -95,6 +95,9 @@ jobs:
     needs: [android, firmware]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
       - uses: actions/download-artifact@v4
         with:
           name: apk
@@ -105,9 +108,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # This build's entry from CHANGELOG.md ("## Build N …" up to the next entry), if there is one
+          awk -v n="${{ github.run_number }}" '
+            /^## Build/ { on = ($3 == n) }
+            on && /^---$/ { exit }
+            on' CHANGELOG.md > notes.md || true
+          if [ ! -s notes.md ]; then echo "Fixes and small changes. See CHANGELOG.md." > notes.md; fi
+          printf '\n---\nInstall `ioniq6-autolock.apk` on the phone. Flash `esp32-car-tag.bin` at address 0x0 only when the changelog says so.\nFull history: [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) · commit ${{ github.sha }}\n' >> notes.md
           gh release create "build-${{ github.run_number }}" \
             ioniq6-autolock.apk esp32-car-tag.bin \
             --repo "${{ github.repository }}" \
             --title "Build ${{ github.run_number }}" \
-            --notes "Commit ${{ github.sha }}. Install ioniq6-autolock.apk on the phone; flash esp32-car-tag.bin at address 0x0." \
+            --notes-file notes.md \
             --latest

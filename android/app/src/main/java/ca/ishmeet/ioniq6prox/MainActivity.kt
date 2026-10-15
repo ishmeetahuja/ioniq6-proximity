@@ -110,7 +110,7 @@ class MainActivity : Activity() {
     private val ticker = object : Runnable {
         override fun run() {
             renderAutoLock()
-            if (Status.seq != lastSeq) { lastSeq = Status.seq; renderCar() }
+            if (Status.seq != lastSeq) { lastSeq = Status.seq; CarApi.cached(prefs)?.let { car = it }; renderCar() }
             maybeRefresh()
             handler.postDelayed(this, 1_000)
         }
@@ -136,9 +136,7 @@ class MainActivity : Activity() {
             loadStatus(live = true, auto = true)
             return
         }
-        val every = prefs.statusEveryMin
-        if (every == 0 && car != null) return
-        val gap = (if (every == 0) 1 else every) * 60_000L
+        val gap = prefs.statusEveryMin * 60_000L   // at most twice an hour
         if (now - maxOf(prefs.lastStatusAt, lastAttemptAt) < gap) return
         lastAttemptAt = now
         loadStatus(live = false)
@@ -438,23 +436,32 @@ class MainActivity : Activity() {
         val mine = prefs.lockConfirmedAt >= serverLockAt
         val lockAt = if (mine) prefs.lockConfirmedAt else serverLockAt
         val locked = if (mine) prefs.lockConfirmedLocked else c?.locked == true
-        val by = if (mine) prefs.lockConfirmedBy else ""
-        val driving = Status.running && Status.carConnected == true && onAt >= offAt
+        val by = if (mine && prefs.lockConfirmedBy.isNotBlank()) " by ${prefs.lockConfirmedBy}" else ""
+        val lockWord = if (locked) "Locked" else "Unlocked"
+        val lockColor = if (locked) Ui.GLACIER else Ui.AMBER
+        val lockLine = "$lockWord at ${clock(lockAt)}$by"
+
+        val watching = Status.running
+        val inCar = watching && Status.carConnected == true && onAt >= offAt          // car's Bluetooth
+        val parked = offAt > 0 && offAt >= onAt && !inCar
+        val atCar = parked && watching && Status.espConnected                          // ESP32 in range
         return when {
             Status.locking -> Triple("Locking…", Ui.GLACIER, Status.lockMessage?.takeIf { !it.startsWith("Locking") })
-            driving -> Triple("Driving", Ui.GLACIER, "Connected to the car's Bluetooth")
-            // a lock/unlock confirmed after the last drive began and newer than Hyundai's data
-            lockAt > 0 && lockAt > onAt && lockAt > upd ->
-                Triple(if (locked) "Locked" else "Unlocked", if (locked) Ui.GLACIER else Ui.AMBER,
-                    (if (locked) "Locked" else "Unlocked") + " at ${clock(lockAt)}" + (if (by.isNotBlank()) " by $by" else ""))
+            // in the car: GPS tells driving from sitting
+            inCar && Status.moving == true -> Triple("Driving", Ui.GLACIER, "Connected to the car and moving")
+            inCar -> Triple("In the car", Ui.GLACIER, if (Status.moving == false) "Connected to the car, not moving" else "Connected to the car's Bluetooth")
+            // parked, at the car (tag in range): locked only once a lock is confirmed after you parked
+            atCar && lockAt > offAt -> Triple(lockWord, lockColor, "Parked · $lockLine")
+            atCar -> Triple("Not locked yet", Ui.AMBER, "Parked at ${clock(offAt)} · locks when you walk away")
+            // away from the car (no car Bluetooth, no tag): last confirmed lock, else Hyundai's report
+            lockAt > 0 && lockAt > onAt && lockAt > upd -> Triple(lockWord, lockColor, "Away · $lockLine")
             c == null -> Triple(if (carError != null) "No contact" else if (prefs.configured) "Checking…" else "Not set up", Ui.FAINT, null)
-            // you parked after Hyundai's data was taken, so "car on"/"locked" from it is out of date
-            offAt > upd && offAt >= onAt -> Triple("Parked", Ui.TEXT,
-                if (prefs.carOffAtStartup) "Your phone isn't connected to the car, so it's not being driven. Lock state not confirmed yet"
-                else "Parked at ${clock(offAt)}. Lock state not confirmed yet")
-            c.carOn -> Triple("Car on", Ui.GLACIER, null)
-            c.locked == true -> Triple("Locked", Ui.GLACIER, null)
-            c.locked == false -> Triple("Unlocked", Ui.AMBER, null)
+            parked && offAt > upd -> Triple("Not confirmed", Ui.AMBER,
+                if (prefs.carOffAtStartup) "Away · no lock confirmed yet. Tap Refresh to ask the car"
+                else "Away · parked at ${clock(offAt)}, no lock confirmed since. Tap Refresh to ask the car")
+            c.carOn -> Triple("Car on", Ui.GLACIER, "Hyundai's report from ${clock(upd)}")
+            c.locked == true -> Triple("Locked", Ui.GLACIER, "Away · Hyundai's report from ${clock(upd)}")
+            c.locked == false -> Triple("Unlocked", Ui.AMBER, "Away · Hyundai's report from ${clock(upd)}")
             else -> Triple("Unknown", Ui.FAINT, null)
         }
     }
@@ -628,7 +635,7 @@ class MainActivity : Activity() {
     }
 
     private fun doLock() = runCommand(lockTile, "Locking…", "Locked", needsAdmin = false, after = { ok ->
-        if (ok) { prefs.confirmLock(true, "you"); renderCar() }
+        if (ok) { prefs.confirmLock(true, "you"); renderCar(); handler.postDelayed({ loadStatus(live = false) }, 60_000) }
     }) { CarApi.command(prefs, "POST", "/v1/lock", needsAdmin = false) }
 
     private fun confirmUnlock() {

@@ -17,6 +17,8 @@ car USB ──► power bank ──► ESP32 (Bluetooth tag in the glovebox)
 
 The ESP32 needs no Wi-Fi or internet. The phone does the talking.
 
+**What changed in each version:** [CHANGELOG.md](CHANGELOG.md) (plain language, with examples).
+
 Every push to `main` builds both pieces on GitHub and publishes them under **Releases**:
 `ioniq6-autolock.apk` (phone) and `esp32-car-tag.bin` (ESP32).
 
