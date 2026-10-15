@@ -10,6 +10,24 @@ different, in plain words, with an example. Newest first.
 
 ---
 
+## Build 31 — Oct 15, 2026 · app
+
+**At home, only the 20-second rule locks the car.**
+
+- Before, in the first seconds after parking, while the app was still checking whether you were
+  home (joining Wi-Fi, getting a GPS fix), a drop in the ESP32's signal could fire the normal
+  walk-away lock first.
+- Now the signal walk-away **waits until the home check is done**. That usually takes a second or
+  two, and never more than 30 seconds.
+- Example: you pull into the driveway and walk straight inside. The car locks **20 s after you
+  left it, because of the home rule**, never because the signal dropped.
+- Away from home nothing changes. As soon as GPS says you're not home (usually instantly), the
+  signal walk-away works as before.
+
+**Update:** app only.
+
+---
+
 ## Build 30 — Oct 15, 2026 · app + server
 
 **Every lock tells you why it happened, and every lock shows up in ntfy.**

@@ -409,9 +409,16 @@ class ProximityService : Service() {
             val d = Home.distance(prefs, loc) ?: return@locate
             if (Home.inside(prefs, loc)) enterHome("parked ${Home.describe(d)} from home")
             else if (loc.accuracy > 300) nextLocateAt = now() + LOCATE_RETRY_MS   // too vague to rule home out
-            else { nextLocateAt = Long.MAX_VALUE; Status.log("Parked ${Home.describe(d)} from home — normal walk-away") }
+            else { nextLocateAt = Long.MAX_VALUE; homeCheckUntil = 0; Status.log("Parked ${Home.describe(d)} from home — normal walk-away") }
         }
     }
+
+    /**
+     * Still working out whether we parked at home (Wi-Fi joining, GPS fix): hold the signal-based
+     * walk-away, because at home the 20-second rule is the one that should lock. Usually this
+     * takes a second or two; after 30 s we stop waiting.
+     */
+    private fun homeUndecided(t: Long) = homeCheckUntil > 0 && t - parkedAt < 30_000
 
     /** Parked at home. Parking is the first visit: lock once you've been away from the car homeDelaySec. */
     private fun enterHome(why: String) {
@@ -645,12 +652,12 @@ class ProximityService : Service() {
                                 lockAway("esp32-power-lost", "the ESP32 lost power and the car's Bluetooth never came back", "backup rule", checkFirst = true)
                             }
                         } else if (t - linkDownSince > LINK_HOLD_MS) {
-                            walkedAway("ESP32 out of range")
+                            if (!homeUndecided(t)) walkedAway("ESP32 out of range")
                         }
                     }
                 } else if (s != null && s < threshold) {
                     if (belowSince == 0L) belowSince = t
-                    if (settled && t - belowSince > RSSI_HOLD_MS) walkedAway("signal ${s.toInt()} dBm (threshold $threshold)")
+                    if (settled && t - belowSince > RSSI_HOLD_MS && !homeUndecided(t)) walkedAway("signal ${s.toInt()} dBm (threshold $threshold)")
                 } else {
                     belowSince = 0
                 }
