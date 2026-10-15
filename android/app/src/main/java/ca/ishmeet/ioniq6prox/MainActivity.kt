@@ -321,7 +321,7 @@ class MainActivity : Activity() {
             Status.mode.startsWith("Driving") -> "Driving" to "Watches again when you park."
             Status.mode.startsWith("Parked") -> "Parked, watching" to "Locks when the tag's signal drops below $thr dBm."
             Status.mode.startsWith("Away") -> "Away" to "You walked off; the car was told to lock."
-            Status.mode.startsWith("At home") -> "At home" to "Locks once after you park at home, then stays quiet until your next drive."
+            Status.mode.startsWith("At home") -> "At home" to "Locks once each time you've been at the car and then left it for ${prefs.homeDelaySec} s. Walking around the house doesn't count."
             else -> "Waiting for the car" to "Arms when you finish a drive, or after 30 s right by the car."
         }
         modeWord.text = word

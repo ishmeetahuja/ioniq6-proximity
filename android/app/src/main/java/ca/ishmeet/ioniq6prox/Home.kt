@@ -75,12 +75,17 @@ object Home {
         } catch (_: Exception) { null }
     }
 
-    /** Quick check with what the phone already knows (Wi-Fi now, or a recent location). */
-    fun atHomeNow(c: Context, p: Prefs, wifi: String?): Boolean {
+    /**
+     * Quick check with what the phone already knows: true = home, false = somewhere else,
+     * null = can't tell (not on Wi-Fi and no recent location).
+     */
+    fun where(c: Context, p: Prefs, wifi: String?): Boolean? {
         if (!enabled(p)) return false
-        if (isHomeWifi(p, wifi ?: currentWifi(c))) return true
-        val loc = lastKnown(c) ?: return false
-        return inside(p, loc)
+        val w = wifi ?: currentWifi(c)
+        if (isHomeWifi(p, w)) return true
+        val loc = lastKnown(c)
+        if (loc != null && p.homeLat != null) return inside(p, loc)
+        return if (w != null) false else null   // on some other Wi-Fi → not home
     }
 
     /** "46.48998, -80.90417" → pair, or null if it doesn't parse. */

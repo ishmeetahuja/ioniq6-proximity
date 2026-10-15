@@ -62,6 +62,7 @@ class SettingsActivity : Activity() {
     private lateinit var wifiEdit: EditText
     private lateinit var spotEdit: EditText
     private lateinit var delayEdit: EditText
+    private lateinit var atCarEdit: EditText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -165,7 +166,7 @@ class SettingsActivity : Activity() {
             addView(row(dp(10), pillButton("Save") { saveThreshold() }, pillButton("Use current signal", Ui.GLACIER, Ui.ON_ACCENT) { useCurrentSignal() }), Ui.lp(top = dp(16)))
         }
 
-        section(col, "Home", "Parked at home, the car locks once, then the app stays quiet until your next drive, even if the tag is in range from the house. It knows you're home from your Wi-Fi or your location.") {
+        section(col, "Home", "From the house the tag is often still in range, so at home the app locks once per visit to the car instead: after you park, or after you've been right at the car, it locks once you've been away from it for a while. Walking around the house never counts. It knows you're home from your Wi-Fi or your location.") {
             homeValue = item("Home mode", "Switch") { toggleHome() }
             locValue = item("Location access", "Allow") { askLocation() }
             label("Home Wi-Fi name")
@@ -176,7 +177,15 @@ class SettingsActivity : Activity() {
             spotEdit = field("46.49, -80.90", spot, InputType.TYPE_CLASS_TEXT)
             addView(spotEdit, Ui.lp(top = dp(6)))
             addView(row(dp(10), pillButton("Use current Wi-Fi") { useCurrentWifi() }, pillButton("Use current location") { useCurrentSpot() }), Ui.lp(top = dp(12)))
-            label("Lock this many seconds after parking")
+            label("“At the car”: signal at least (dBm). Stand at the driver's door and use the current signal")
+            atCarEdit = field(prefs.atCarRssi.toString(), prefs.atCarRssiSet?.toString() ?: "", InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED)
+            addView(atCarEdit, Ui.lp(top = dp(6)))
+            addView(pillButton("Use current signal") {
+                val r = Status.rssi ?: run { bar.show("No live signal. Turn walk-away lock on and connect the ESP32.", Ui.AMBER); return@pillButton }
+                atCarEdit.setText(r.toString())
+                if (storeHome(quiet = true)) bar.show("At the car = $r dBm or stronger", Ui.GLACIER)
+            }, Ui.lp(top = dp(12)))
+            label("Lock once you've been away from the car this many seconds")
             delayEdit = field("60", prefs.homeDelaySec.toString(), InputType.TYPE_CLASS_NUMBER)
             addView(delayEdit, Ui.lp(top = dp(6)))
             addView(row(dp(10), pillButton("Save") { saveHome() }, pillButton("Am I home?", Ui.GLACIER, Ui.ON_ACCENT) { checkHomeNow() }), Ui.lp(top = dp(16)))
@@ -209,7 +218,7 @@ class SettingsActivity : Activity() {
         liveSignal.text = Status.rssi?.let { "Now: $it dBm" } ?: "No live signal"
         liveSignal.setTextColor(if (Status.rssi != null) Ui.TEXT else Ui.FAINT)
         logView.text = Status.logText().ifEmpty { "Nothing yet." }
-        homeValue.text = if (prefs.homeOn) "On, locks ${prefs.homeDelaySec} s after parking at home" else "Off"
+        homeValue.text = if (prefs.homeOn) "On: locks once you've been away from the car ${prefs.homeDelaySec} s (at the car = ${prefs.atCarRssi} dBm or stronger)" else "Off"
         homeValue.setTextColor(if (prefs.homeOn) Ui.GLACIER else Ui.MUTED)
         locValue.text = when {
             Home.hasBackground(this) -> "All the time"
@@ -226,11 +235,16 @@ class SettingsActivity : Activity() {
         val spotText = spotEdit.text.toString().trim()
         val spot = if (spotText.isEmpty()) null else Home.parse(spotText)
         if (spotText.isNotEmpty() && spot == null) { bar.show("Location should look like: 46.48998, -80.90417", Ui.CORAL); return false }
+        val atCarText = atCarEdit.text.toString().trim()
+        val atCar = if (atCarText.isEmpty()) null else atCarText.toIntOrNull()
+        if (atCarText.isNotEmpty() && (atCar == null || atCar !in -100..-30)) { bar.show("“At the car” should be between -100 and -30", Ui.CORAL); return false }
+        if (atCar != null && atCar <= prefs.awayRssi) { bar.show("“At the car” must be stronger than the walk-away level (${prefs.awayRssi})", Ui.CORAL); return false }
         val delay = delayEdit.text.toString().trim().toIntOrNull()
         if (delay == null || delay !in 0..600) { bar.show("Use 0 to 600 seconds", Ui.CORAL); return false }
         prefs.homeWifi = wifiEdit.text.toString()
         prefs.setHomeSpot(spot)
         prefs.homeDelaySec = delay
+        prefs.atCarRssiSet = atCar
         if (!quiet) bar.show("Saved", Ui.GLACIER)
         render()
         return true

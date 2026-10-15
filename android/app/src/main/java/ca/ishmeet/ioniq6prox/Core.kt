@@ -63,7 +63,12 @@ class Prefs(c: Context) {
     fun setHomeSpot(spot: Pair<Double, Double>?) {
         sp.edit().putString("homeLat", spot?.first?.toString()).putString("homeLon", spot?.second?.toString()).apply()
     }
-    /** Seconds after parking at home before the one lock. */
+    /** At home, a signal at least this strong (dBm) means you're right at the car. */
+    var atCarRssiSet: Int?
+        get() = if (sp.contains("atcar")) sp.getInt("atcar", -60) else null
+        set(v) { sp.edit().apply { if (v == null) remove("atcar") else putInt("atcar", v) }.apply() }
+    val atCarRssi: Int get() = atCarRssiSet ?: (awayRssi + 15).coerceAtMost(-45)
+    /** At home: seconds away from the car before the one lock. */
     var homeDelaySec: Int
         get() = sp.getInt("homeDelay", 60)
         set(v) { sp.edit().putInt("homeDelay", v).apply() }

@@ -57,9 +57,12 @@ import java.util.concurrent.Executors
  * bank…), we fall back to car Bluetooth alone with the server's normal grace period.
  *
  *   HOME     — (home mode on) parked at home: on the home Wi-Fi, or within the home circle.
- *              Locks ONCE, homeDelaySec after parking (or not at all if a walk-away already
- *              locked it this stop), then ignores the tag until the next drive — walking around
- *              the house near the driveway doesn't keep locking the car.
+ *              From the house the tag is often still "in range", so walk-away by signal doesn't
+ *              work there. Instead: one lock per VISIT to the car. A visit is being right at the
+ *              car (signal at or above the "at the car" level for VISIT_MS) — parking counts as
+ *              one. Once you've been away from the car for homeDelaySec, it locks once (check-
+ *              first, so an already-locked car is left alone). Wandering around the house never
+ *              reaches the at-the-car level, so nothing fires.
  */
 class ProximityService : Service() {
 
@@ -87,6 +90,8 @@ class ProximityService : Service() {
         private const val MAX_AWAYS_PER_STOP = 5
         private const val HOME_DETECT_MS = 2 * 60_000L // after parking, look for "home" this long
         private const val LOCATE_RETRY_MS = 20_000L
+        private const val VISIT_MS = 5_000L            // at the car this long = a visit
+        private const val HOME_RECHECK_MS = 60_000L
 
         fun hasPermissions(c: Context): Boolean {
             val need = mutableListOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN)
@@ -139,6 +144,12 @@ class ProximityService : Service() {
     private var nextLocateAt = 0L
     private var locating = false
     @Volatile private var wifiName: String? = null
+    private var lastAtCarAt = 0L          // last time the signal was at the "at the car" level
+    private var atCarSince = 0L
+    private var visiting = false          // at home: a visit is open; lock once you've left the car
+    private var visitIsParking = false    // the open visit is the one that started with parking
+    private var homeCachedAt = 0L
+    private var homeCached: Boolean? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -319,23 +330,82 @@ class ProximityService : Service() {
         }
     }
 
-    /** Parked at home: one lock (unless one was already sent this stop), then quiet until the next drive. */
+    /** Parked at home. Parking is the first visit: lock once you've been away from the car homeDelaySec. */
     private fun enterHome(why: String) {
         if (mode == Mode.HOME) return
         homeCheckUntil = 0
         stopScan()
-        val alreadySent = awaysThisStop > 0
-        awaysThisStop++
         belowSince = 0
         aboveSince = 0
-        if (alreadySent) {
-            setMode(Mode.HOME, "$why — already locked once, staying quiet until the next drive")
-            return
+        atCarSince = 0
+        val alreadySent = awaysThisStop > 0
+        awaysThisStop++
+        visiting = !alreadySent
+        visitIsParking = true
+        lastAtCarAt = maxOf(lastAtCarAt, parkedAt)
+        setMode(Mode.HOME, if (alreadySent) "$why — already locked; locks again only after you've been at the car"
+                           else "$why — locks once you've been away from the car ${prefs.homeDelaySec}s")
+    }
+
+    /** Back at home without a drive (app restarted, or you came home on foot): wait for a visit. */
+    private fun homeQuiet(why: String) {
+        visiting = false
+        atCarSince = 0
+        aboveSince = 0
+        setMode(Mode.HOME, why)
+    }
+
+    /** true = home, false = elsewhere, null = can't tell. Re-checked at most once a minute. */
+    private fun whereCached(t: Long): Boolean? {
+        if (t - homeCachedAt > HOME_RECHECK_MS) { homeCached = Home.where(this, prefs, wifiName); homeCachedAt = t }
+        return homeCached
+    }
+
+    /** One second of home logic: start visits, and lock once after each. */
+    private fun homeTick(t: Long, atCar: Boolean) {
+        if (atCar) {
+            if (atCarSince == 0L) atCarSince = t
+            if (!visiting && t - atCarSince >= VISIT_MS) {
+                homeCachedAt = 0
+                if (!Home.enabled(prefs) || whereCached(t) == false) {
+                    // At the car somewhere that isn't home (a drive the phone missed): normal walk-away.
+                    // If we can't tell where we are, we stay in home mode: we were home last.
+                    rearm("at the car, not at home — normal walk-away")
+                    return
+                }
+                visiting = true
+                visitIsParking = false
+                setMode(Mode.HOME, "at the car — locks once you've been away from it ${prefs.homeDelaySec}s")
+                send("/v1/autolock/near", """{"source":"esp32-home"}""", "near")
+            }
+        } else atCarSince = 0
+        if (visiting && t - lastAtCarAt >= prefs.homeDelaySec * 1000L) {
+            visiting = false
+            // First lock after a drive: send straight away. After a later visit: check first, so a car
+            // you locked yourself isn't sent a pointless command.
+            // And if the tag lost power at full signal (you may have started the car), let the
+            // server check too: it skips the lock when the car is on.
+            val fast = visitIsParking && !armedByProximity && !dropWasPowerCut
+            lastAwayAt = t
+            setMode(Mode.HOME, "away from the car ${prefs.homeDelaySec}s — locking once")
+            val body = if (fast) """{"source":"home","graceSeconds":0}"""
+                       else """{"source":"home","graceSeconds":0,"checkFirst":true}"""
+            send("/v1/autolock/away", body, "away")
         }
-        val left = (prefs.homeDelaySec - (now() - parkedAt) / 1000).coerceIn(0, 600)
-        setMode(Mode.HOME, "$why — locking once in ${left}s, then quiet until the next drive")
-        lastAwayAt = now()
-        send("/v1/autolock/away", """{"source":"home","graceSeconds":$left}""", "away")
+    }
+
+    private fun rearm(why: String) {
+        aboveSince = 0
+        belowSince = 0
+        atCarSince = 0
+        visiting = false
+        tagSeenThisStop = true
+        dropWasPowerCut = false
+        armedByProximity = true
+        if (now() - lastAwayAt > AWAY_COUNT_RESET_MS) awaysThisStop = 0
+        parkedAt = now() - SETTLE_MS // already settled
+        setMode(Mode.PARKED, why)
+        send("/v1/autolock/near", """{"source":"esp32"}""", "near")
     }
 
     // ------------------------------------------------------------------ ESP32 tag
@@ -456,6 +526,8 @@ class ProximityService : Service() {
         if (t - lastHealthAt > HEALTH_EVERY_MS) { lastHealthAt = t; checkServer() }
         val threshold = prefs.awayRssi
         val s = smoothed
+        val atCar = espConnected && s != null && s >= prefs.atCarRssi
+        if (atCar) lastAtCarAt = t
         if (homeCheckUntil > 0) checkHome(t)
 
         when (mode) {
@@ -492,29 +564,19 @@ class ProximityService : Service() {
                     belowSince = 0
                 }
             }
+            Mode.HOME -> homeTick(t, atCar)
             // Not driving, but you're right by the car (e.g. you opened it to grab something,
             // or came back after walking away): after REARM_MS close to the tag, arm. The next
             // walk-away asks the server to check first, so an already-locked car is left alone.
-            // HOME too: if you're near the car somewhere that isn't home (a drive the phone missed),
-            // normal walk-away takes over again.
-            Mode.AWAY, Mode.UNKNOWN, Mode.HOME -> {
+            // At home that would misfire (the tag reaches the house), so home mode takes over.
+            Mode.AWAY, Mode.UNKNOWN -> {
                 if (espConnected && s != null && s > threshold + HYSTERESIS_DB) {
                     if (aboveSince == 0L) aboveSince = t
-                    if (t - aboveSince > REARM_MS && Home.atHomeNow(this, prefs, wifiName)) {
-                        // At home the tag is often in range from the house: never re-arm there.
-                        aboveSince = 0
-                        if (mode != Mode.HOME) setMode(Mode.HOME, "near the car at home — staying quiet until the next drive")
+                    if (t - aboveSince > VISIT_MS && Home.enabled(prefs) && whereCached(t) == true) {
+                        homeQuiet("at home — locks once after each visit to the car")
+                        homeTick(t, atCar)
                     } else if (t - aboveSince > REARM_MS) {
-                        val why = if (mode == Mode.AWAY) "back near the car — re-armed" else "near the car (no drive) — armed"
-                        aboveSince = 0
-                        belowSince = 0
-                        tagSeenThisStop = true
-                        dropWasPowerCut = false
-                        armedByProximity = true
-                        if (t - lastAwayAt > AWAY_COUNT_RESET_MS) awaysThisStop = 0
-                        parkedAt = t - SETTLE_MS // already settled
-                        setMode(Mode.PARKED, why)
-                        send("/v1/autolock/near", """{"source":"esp32"}""", "near")
+                        rearm(if (mode == Mode.AWAY) "back near the car — re-armed" else "near the car (no drive) — armed")
                     }
                 } else {
                     aboveSince = 0
