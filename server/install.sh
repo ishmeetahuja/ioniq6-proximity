@@ -269,10 +269,11 @@ doctor() {
   rm -f "$err"
 
   if { command -v systemctl >/dev/null && systemctl is-active --quiet ioniq6-watchdog.timer 2>/dev/null; } || \
-     { [ -n "$UNRAID" ] && crontab -l 2>/dev/null | grep -q ioniq6/watchdog.sh; }; then
+     { [ -n "$UNRAID" ] && { crontab -l 2>/dev/null; cat /etc/cron.d/root /var/spool/cron/crontabs/root 2>/dev/null; } | grep -q ioniq6/watchdog.sh; }; then
     pass "watchdog running (restarts the server if it stops)"
   else
-    fail "watchdog not running — run: sudo bash install.sh"
+    if [ -n "$UNRAID" ]; then fail "watchdog not running — run: cd $DIR && bash install.sh"
+    else fail "watchdog not running — run: sudo bash install.sh"; fi
   fi
   if journalctl -t ioniq6-watchdog --since "-7 days" 2>/dev/null | grep -q "restarted itself"; then
     echo "  note  the watchdog restarted the server in the last 7 days:"
