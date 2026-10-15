@@ -46,10 +46,10 @@ function hexToTemp(v, year = 2023) {
   return tempMin(year) + parseInt(v.slice(0, -1), 16) / 2;
 }
 function parseStamp(s) {
-  // "20261013131500" -> "2026-10-13 13:15:00" (local time of the zone set in the car)
+  // Hyundai Canada sends UTC without saying so: "20261013131500" -> "2026-10-13T13:15:00Z"
   if (typeof s !== 'string' || !/^\d{12,14}$/.test(s)) return s ?? null;
   const p = (a, b) => s.slice(a, b);
-  return `${p(0, 4)}-${p(4, 6)}-${p(6, 8)} ${p(8, 10)}:${p(10, 12)}${s.length >= 14 ? ':' + p(12, 14) : ''}`;
+  return `${p(0, 4)}-${p(4, 6)}-${p(6, 8)}T${p(8, 10)}:${p(10, 12)}:${s.length >= 14 ? p(12, 14) : '00'}Z`;
 }
 
 const SEAT = { off: 0, 'low-heat': 6, 'med-heat': 7, 'high-heat': 8, 'low-cool': 3, 'med-cool': 4, 'high-cool': 5 };

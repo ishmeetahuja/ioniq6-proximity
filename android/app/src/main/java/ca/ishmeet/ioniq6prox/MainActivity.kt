@@ -345,8 +345,11 @@ class MainActivity : Activity() {
 
     private fun fmtMinutes(m: Int) = if (m >= 60) "${m / 60} h ${m % 60} min" else "$m min"
     private fun fmtTemp(t: Double) = if (t % 1.0 == 0.0) "${t.toInt()}°" else "$t°"
+    /** Hyundai's times are UTC: "…Z" from current servers, or a bare "2026-10-13 13:15:00" from older ones. */
     private fun fmtUpdated(s: String): String = try {
-        val t = java.time.LocalDateTime.parse(s.replace(' ', 'T'))
+        val utc = if (s.endsWith("Z")) java.time.Instant.parse(s)
+                  else java.time.LocalDateTime.parse(s.replace(' ', 'T')).toInstant(java.time.ZoneOffset.UTC)
+        val t = utc.atZone(java.time.ZoneId.systemDefault())
         val today = java.time.LocalDate.now()
         val f = if (t.toLocalDate() == today) "h:mm a" else "MMM d, h:mm a"
         "Updated " + t.format(java.time.format.DateTimeFormatter.ofPattern(f))

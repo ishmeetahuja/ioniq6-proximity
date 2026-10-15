@@ -20,6 +20,13 @@ class CliError extends Error {
   constructor(msg, code = 1) { super(msg); this.exitCode = code; }
 }
 
+/** "2026-10-13T13:15:00Z" -> "Oct 13, 9:15 AM" in this computer's time zone. */
+function localStamp(iso) {
+  const d = iso ? new Date(iso) : null;
+  if (!d || isNaN(d)) return iso || 'unknown';
+  return d.toLocaleString('en-CA', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
@@ -45,7 +52,7 @@ function prompt(question, { hidden = false } = {}) {
 function printStatus(x) {
   const yes = (b) => (b ? 'yes' : 'no');
   const L = [];
-  L.push(`${x.vehicle}  (as of ${x.updated || 'unknown'})`);
+  L.push(`${x.vehicle}  (as of ${localStamp(x.updated)})`);
   L.push('');
   L.push(`  Battery      ${x.battery ?? '?'}%   range ${x.range_km ?? '?'} km`);
   let plug = x.plugged_in ? 'plugged in' : 'unplugged';
@@ -234,7 +241,7 @@ async function main() {
     }
     case 'location': {
       const r = await api.location();
-      return out(`${r.lat}, ${r.lon}  (as of ${r.time})\n${r.maps}`, r);
+      return out(`${r.lat}, ${r.lon}  (as of ${localStamp(r.time)})\n${r.maps}`, r);
     }
     case 'lock': return report('Lock', await api.lock(opts));
     case 'unlock': return report('Unlock', await api.unlock(opts));
