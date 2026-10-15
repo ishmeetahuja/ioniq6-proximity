@@ -132,8 +132,9 @@ The home screen shows the car, its state, the controls and the walk-away lock. S
 7. Back on the home screen, turn **Walk-away lock** on.
 8. Optional, **Settings → Home**: type your home Wi-Fi name (or tap **Use current Wi-Fi** at home),
    tap **Use current location** while standing at the driveway, stand at the driver's door and
-   tap **Use current signal** for "At the car", then **Home mode → Switch** and allow location
-   **"Allow all the time"**. **Am I home?** tests it.
+   tap **Use current signal** for "At the car", and allow location **"Allow all the time"**.
+   There's no switch: once a Wi-Fi name or location is saved, home detection is automatic.
+   **Am I home?** tests it.
 
 ## 5 · Test it
 

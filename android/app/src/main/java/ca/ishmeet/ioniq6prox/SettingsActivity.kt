@@ -166,8 +166,8 @@ class SettingsActivity : Activity() {
             addView(row(dp(10), pillButton("Save") { saveThreshold() }, pillButton("Use current signal", Ui.GLACIER, Ui.ON_ACCENT) { useCurrentSignal() }), Ui.lp(top = dp(16)))
         }
 
-        section(col, "Home", "From the house the tag is often still in range, so at home the app locks once per visit to the car instead: after you park, or after you've been right at the car, it locks once you've been away from it for a while. Walking around the house never counts. It knows you're home from your Wi-Fi or your location.") {
-            homeValue = item("Home mode", "Switch") { toggleHome() }
+        section(col, "Home", "Nothing to switch on: once your home Wi-Fi name (or location) is saved, the app knows by itself when you're home. There, it locks once per visit to the car (after you park, or after you've been right at the car) instead of every time the signal drops, because the tag often reaches the house.") {
+            homeValue = item("Home detection", "Am I home?") { checkHomeNow() }
             locValue = item("Location access", "Allow") { askLocation() }
             label("Home Wi-Fi name")
             wifiEdit = field("Wi-Fi name", prefs.homeWifi)
@@ -237,8 +237,13 @@ class SettingsActivity : Activity() {
         liveSignal.text = Status.rssi?.let { "Now: $it dBm" } ?: "No live signal"
         liveSignal.setTextColor(if (Status.rssi != null) Ui.TEXT else Ui.FAINT)
         logView.text = Status.logText().ifEmpty { "Nothing yet." }
-        homeValue.text = if (prefs.homeOn) "On: locks once you've been away from the car ${prefs.homeDelaySec} s (at the car = ${prefs.atCarRssi} dBm or stronger)" else "Off"
-        homeValue.setTextColor(if (prefs.homeOn) Ui.GLACIER else Ui.MUTED)
+        val on = Home.enabled(prefs)
+        homeValue.text = when {
+            !on -> "Off until you save your home Wi-Fi name or location below"
+            !Home.hasBackground(this) -> "Needs location “Allow all the time” (below) to work with the screen off"
+            else -> "Automatic, by " + listOfNotNull(prefs.homeWifi.takeIf { it.isNotBlank() }?.let { "Wi-Fi “$it”" }, prefs.homeLat?.let { "location" }).joinToString(" or ")
+        }
+        homeValue.setTextColor(if (on && Home.hasBackground(this)) Ui.GLACIER else Ui.AMBER)
         locValue.text = when {
             Home.hasBackground(this) -> "All the time"
             Home.hasLocation(this) -> "Only while the app is open. Tap Allow, then pick “Allow all the time”"
@@ -269,16 +274,10 @@ class SettingsActivity : Activity() {
         return true
     }
 
-    private fun saveHome() { storeHome() }
-
-    private fun toggleHome() {
-        if (prefs.homeOn) { prefs.homeOn = false; render(); bar.show("Home mode off"); return }
+    private fun saveHome() {
         if (!storeHome(quiet = true)) return
-        if (prefs.homeWifi.isBlank() && prefs.homeLat == null) { bar.show("Enter your home Wi-Fi name or location first", Ui.AMBER); return }
-        prefs.homeOn = true
-        render()
-        if (!Home.hasBackground(this)) { bar.show("Home mode on. Now allow location all the time.", Ui.AMBER); askLocation() }
-        else bar.show("Home mode on", Ui.GLACIER)
+        if (Home.enabled(prefs) && !Home.hasBackground(this)) { bar.show("Saved. Now allow location all the time.", Ui.AMBER); askLocation() }
+        else bar.show("Saved", Ui.GLACIER)
     }
 
     private fun askLocation() {
@@ -305,7 +304,8 @@ class SettingsActivity : Activity() {
         val w = Home.currentWifi(this) ?: run { bar.show("Not connected to Wi-Fi right now", Ui.AMBER); return }
         wifiEdit.setText(w)
         storeHome(quiet = true)
-        bar.show("Home Wi-Fi: $w", Ui.GLACIER)
+        bar.show("Home Wi-Fi: $w. Home detection is on.", Ui.GLACIER)
+        if (!Home.hasBackground(this)) askLocation()
     }
 
     private fun useCurrentSpot() {
@@ -315,7 +315,8 @@ class SettingsActivity : Activity() {
             if (loc == null) { bar.show("Couldn't get a location. Is location turned on?", Ui.CORAL); return@locate }
             spotEdit.setText(String.format(java.util.Locale.US, "%.6f, %.6f", loc.latitude, loc.longitude))
             storeHome(quiet = true)
-            bar.show("Home location set (accurate to about ${loc.accuracy.toInt()} m)", Ui.GLACIER)
+            bar.show("Home location set (accurate to about ${loc.accuracy.toInt()} m). Home detection is on.", Ui.GLACIER)
+            if (!Home.hasBackground(this)) askLocation()
         }
     }
 

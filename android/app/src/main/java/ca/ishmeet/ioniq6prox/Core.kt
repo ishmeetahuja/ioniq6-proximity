@@ -51,10 +51,7 @@ class Prefs(c: Context) {
         get() = sp.getInt("cmin", 15)
         set(v) { sp.edit().putInt("cmin", v).apply() }
 
-    /** Home mode: at home, lock once after parking, then stay quiet until the next drive. */
-    var homeOn: Boolean
-        get() = sp.getBoolean("homeOn", false)
-        set(v) { sp.edit().putBoolean("homeOn", v).apply() }
+    /** Home: detected automatically from this Wi-Fi name and/or the home spot below. */
     var homeWifi: String
         get() = sp.getString("homeWifi", "") ?: ""
         set(v) { sp.edit().putString("homeWifi", v.trim()).apply() }

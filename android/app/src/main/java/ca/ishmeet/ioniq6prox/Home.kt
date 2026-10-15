@@ -18,7 +18,8 @@ object Home {
     const val RADIUS_M = 150f
     private const val FRESH_MS = 15 * 60_000L
 
-    fun enabled(p: Prefs) = p.homeOn && (p.homeWifi.isNotBlank() || p.homeLat != null)
+    /** Automatic: on as soon as a home Wi-Fi name or home location is saved. Nothing to switch on. */
+    fun enabled(p: Prefs) = p.homeWifi.isNotBlank() || p.homeLat != null
 
     fun hasLocation(c: Context) = c.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     fun hasBackground(c: Context) = c.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
