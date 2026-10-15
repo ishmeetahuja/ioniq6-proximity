@@ -125,11 +125,12 @@ class MainActivity : Activity() {
         val now = System.currentTimeMillis()
         // Ask the car itself (wakes it) when what we have is clearly out of date: nothing yet,
         // Hyundai's copy is older than your last drive/park, or older than 6 hours. At most every
-        // 30 minutes, so it can't wear on the 12 V battery or Hyundai's limits.
+        // 2 hours from here, and the server adds a daily budget and no automatic wake-ups at night,
+        // like the Home Assistant integration does.
         val c = car
         val age = c?.updated?.let { now - utcMillis(it) } ?: Long.MAX_VALUE
         val outOfDate = c == null || stale(c) || age > 6 * 3_600_000L
-        if (outOfDate && now - prefs.lastLiveAt > 30 * 60_000L && now - lastAttemptAt > 60_000L) {
+        if (outOfDate && now - prefs.lastLiveAt > 2 * 3_600_000L && now - lastAttemptAt > 60_000L) {
             lastAttemptAt = now
             prefs.lastLiveAt = now
             loadStatus(live = true, auto = true)
@@ -573,8 +574,19 @@ class MainActivity : Activity() {
         if (live) updated.text = "Asking the car…"
         io.execute {
             try {
-                val s = CarApi.status(prefs, live)
-                runOnUiThread { car = s; carError = null; refreshProblem = null; renderCar() }
+                val s = CarApi.status(prefs, live, auto)
+                runOnUiThread {
+                    car = s; carError = null
+                    refreshProblem = s.refreshSkipped?.let { why ->
+                        val from = s.updated?.let { clock(utcMillis(it)) } ?: "earlier"
+                        when (why) {
+                            "night" -> "Showing Hyundai's saved data from $from. The app doesn't wake the car overnight; tap Refresh to ask it now."
+                            else -> "Showing Hyundai's saved data from $from. To stay within Hyundai's daily limits the app only asks the car itself a few times a day; tap Refresh to ask now."
+                        }
+                    }
+                    renderCar()
+                    if (live && !auto) s.wakeups24h?.let { n -> if (n >= 8) bar.show("Asked the car. That's $n car wake-ups in 24 h; Hyundai limits these, so go easy.", Ui.AMBER, 5_000) }
+                }
             } catch (e: CarApi.Failure) {
                 runOnUiThread {
                     if (car == null) carError = e.message

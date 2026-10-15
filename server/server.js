@@ -36,7 +36,16 @@ const CFG = {
   pollMs: num(env.BLUELINK_POLL_MS, 5000),
   minCooldownSec: num(env.BLUELINK_MIN_COOLDOWN_SECONDS, 600),
   loginRetrySec: num(env.BLUELINK_LOGIN_RETRY_SECONDS, 300),
-  statusCacheSec: num(env.STATUS_CACHE_SECONDS, 60),
+  statusCacheSec: num(env.STATUS_CACHE_SECONDS, 300),   // app opens within this share one Hyundai read
+  // Waking the car (live status, commands, location) is what Hyundai limits per day. Automatic
+  // live refreshes follow the community tools' practice: rarely, within a daily budget, never at night.
+  wake: {
+    autoDailyMax: num(env.AUTO_REFRESH_DAILY_MAX, 4),      // automatic live refreshes per 24 h
+    autoMinGapMin: num(env.AUTO_REFRESH_MIN_GAP_MINUTES, 120),
+    totalSoftMax: num(env.CAR_WAKE_DAILY_SOFT_MAX, 12),    // all wake-ups; above this, automatic ones stop
+    quietFrom: num(env.AUTO_REFRESH_QUIET_FROM_HOUR, 22),  // no automatic wake-ups from…
+    quietTo: num(env.AUTO_REFRESH_QUIET_TO_HOUR, 6),       // …until (local time)
+  },
   commandTimeout: num(env.COMMAND_TIMEOUT_SECONDS, 120),
   autolock: {
     enabled: bool(env.AUTOLOCK_ENABLED, true),
@@ -49,7 +58,9 @@ const CFG = {
     rateLimitBackoffMaxSec: num(env.AUTOLOCK_RATE_LIMIT_BACKOFF_MAX_SECONDS, 600),
   },
   guard: {
-    intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = off
+    intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = off; how often while the car is in use
+    idleMin: num(env.GUARD_IDLE_MINUTES, 360),       // how often when nothing has happened for a while
+    activeHours: num(env.GUARD_ACTIVE_HOURS, 3),     // "in use" = within this long of a drive/park/command
     graceSec: num(env.GUARD_GRACE_SECONDS, 60),
   },
   ntfy: { url: env.NTFY_URL || '', token: env.NTFY_TOKEN || '' },
@@ -82,10 +93,42 @@ const writeJson = (f, o) => {
 const state = Object.assign({
   autolockEnabled: CFG.autolock.enabled, pausedUntil: 0,
   graceSec: CFG.autolock.graceSec, checkFirst: CFG.autolock.checkFirst,
+  wakeups: [],        // [{ t, ep, auto }] for the last 24 h: every time we made Hyundai contact the car
 }, readJson(STATE_FILE) || {});
 const saveState = () => writeJson(STATE_FILE, {
   autolockEnabled: state.autolockEnabled, pausedUntil: state.pausedUntil, graceSec: state.graceSec, checkFirst: state.checkFirst,
+  wakeups: state.wakeups,
 });
+
+// ---------------------------------------------------------------- car wake-up budget
+
+const WAKE_ENDPOINTS = new Set(['rltmvhclsts', 'drlck', 'drulck', 'evc/rfon', 'evc/rfoff', 'evc/rcstrt', 'evc/rcstp', 'evc/setsoc', 'fndmcr']);
+let wakeIsAuto = false;   // set while an automatic refresh runs, so the budget can tell them apart
+function wakeups24h() {
+  const cut = Date.now() - 24 * 3600e3;
+  if (state.wakeups.length && state.wakeups[0].t < cut) state.wakeups = state.wakeups.filter((w) => w.t >= cut);
+  return state.wakeups;
+}
+function noteWake(endpoint) {
+  wakeups24h().push({ t: Date.now(), ep: endpoint, auto: wakeIsAuto || undefined });
+  saveState();
+}
+function localHour() {
+  return Number(new Date().toLocaleString('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: process.env.TZ || 'America/Toronto' }));
+}
+/** Why an automatic live refresh shouldn't happen now, or null if it may. */
+function autoRefreshBlocked() {
+  const w = wakeups24h();
+  const { autoDailyMax, autoMinGapMin, totalSoftMax, quietFrom, quietTo } = CFG.wake;
+  const h = localHour();
+  if (quietFrom !== quietTo && (quietFrom > quietTo ? (h >= quietFrom || h < quietTo) : (h >= quietFrom && h < quietTo))) return 'night';
+  const autos = w.filter((x) => x.auto && x.ep === 'rltmvhclsts');
+  if (autos.length >= autoDailyMax) return 'daily-budget';
+  if (w.length >= totalSoftMax) return 'daily-budget';
+  const lastLive = w.filter((x) => x.ep === 'rltmvhclsts').pop();
+  if (lastLive && Date.now() - lastLive.t < autoMinGapMin * 60000) return 'recent';
+  return null;
+}
 
 // ---------------------------------------------------------------- BlueLink client (serialized)
 
@@ -93,6 +136,7 @@ const saveState = () => writeJson(STATE_FILE, {
 // "2026-10-15T12:32:49.123Z drlck 200". Shown by `install.sh doctor` to see what Hyundai saw.
 const CALL_LOG = path.join(CFG.dataDir, 'hyundai.log');
 function logCall(endpoint, status, code) {
+  if (status === 200 && WAKE_ENDPOINTS.has(endpoint)) noteWake(endpoint);
   const line = `${new Date().toISOString()} ${endpoint} ${status}${code ? ' ' + code : ''}\n`;
   fs.stat(CALL_LOG, (err, st) => {
     if (!err && st.size > 512 * 1024) { try { fs.renameSync(CALL_LOG, CALL_LOG + '.1'); } catch {} }
@@ -161,7 +205,8 @@ ${message}`, disable_notification: priority === 'low' || priority === 'min' };
 
 // ---------------------------------------------------------------- jobs (async commands)
 
-let statusCache = null;   // absorbs repeated app opens: at most one Hyundai status read per minute
+let statusCache = null;   // absorbs repeated app opens: at most one Hyundai status read per few minutes
+let liveCache = null;     // the last answer straight from the car
 // What our own confirmed commands tell us. Hyundai's saved status only refreshes when the car
 // reports in, so after we lock or unlock we know better than it does until it catches up.
 let known = { locked: null, at: 0 };
@@ -181,6 +226,7 @@ function newJob(action, source) {
   return job;
 }
 function runJob(job, fn) {
+  if (!String(job.source || '').startsWith('autolock:')) markActivity();
   return withCar(async () => {
     job.status = 'running';
     try {
@@ -194,6 +240,7 @@ function runJob(job, fn) {
     }
     job.finishedAt = new Date().toISOString();
     statusCache = null;   // the car just changed; next status read goes to Hyundai
+    liveCache = null;
     log(`job ${job.id} ${job.action} -> ${job.status}${job.error ? ': ' + job.error : ''}`);
     return job;
   });
@@ -271,6 +318,7 @@ function alPublic() {
 }
 
 function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null, quiet = false } = {}) {
+  if (source !== 'safety check') markActivity();
   if (!state.autolockEnabled) { alEvent('ignored', `away from ${source}: auto-lock disabled`); return { phase: 'disabled' }; }
   if (state.pausedUntil > Date.now()) { alEvent('ignored', `away from ${source}: paused`); return { phase: 'paused', pausedUntil: new Date(state.pausedUntil).toISOString() }; }
   if (AL.phase !== 'idle') { alEvent('away', `${source} (already ${AL.phase})`); return alPublic(); }
@@ -296,6 +344,7 @@ function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null
 }
 
 function alNear(source = 'phone') {
+  markActivity();
   if (AL.phase === 'pending' || AL.phase === 'retrying' || AL.phase === 'delayed') {
     alEvent('cancelled', `back near the car (${source})`);
     alFinish('cancelled', 'back near the car');
@@ -412,10 +461,22 @@ async function alCheck() {
   }
 }
 
-// Safety net: every N minutes look at the (cheap, cached) status. Unlocked + off on two
-// consecutive checks → run the normal auto-lock flow with a 60 s grace.
+// Safety net: look at the (cheap, cached) status; unlocked + off on two consecutive checks → run
+// the normal auto-lock flow with a 60 s grace. Hyundai's sign-ins last only ~30 min and Cloudflare
+// limits sign-ins hard, so this must not run every 30 min around the clock (that alone meant ~48
+// sign-ins a day). It checks every GUARD_INTERVAL_MINUTES only for a few hours after the car was
+// used (drive, park, command), every GUARD_IDLE_MINUTES otherwise, and not at all when we've
+// confirmed a lock since the car was last used.
+let lastActivity = 0;
+let lastGuardAt = Date.now();      // no check right at start-up
+function markActivity() { lastActivity = Date.now(); }
+function guardDue() {
+  const active = Date.now() - lastActivity < CFG.guard.activeHours * 3600e3 || AL.guardUnlockedSince;
+  return Date.now() - lastGuardAt >= (active ? CFG.guard.intervalMin : CFG.guard.idleMin) * 60000;
+}
 async function guardTick() {
   if (!state.autolockEnabled || state.pausedUntil > Date.now() || AL.phase !== 'idle') return;
+  if (known.locked && known.at > lastActivity) { AL.guardUnlockedSince = null; return; }   // locked since last use
   try {
     const s = await withCar(() => bl.rawStatus({ refresh: false }));
     if (s.engine || s.doorLock) { AL.guardUnlockedSince = null; return; }
@@ -523,11 +584,23 @@ const ROUTES = [
   // reads
   ['GET', /^\/v1\/vehicles$/, 'admin', async (req, res) => send(res, 200, await serial(() => bl.vehicles()))],
   ['GET', /^\/v1\/status$/, 'phone', async (req, res, url) => {
-    const refresh = url.searchParams.get('refresh') === 'true';
-    if (!refresh && statusCache && Date.now() - statusCache.at < CFG.statusCacheSec * 1000) return send(res, 200, withKnown(statusCache.value));
-    const value = await withCar(() => bl.status({ refresh }));
+    let refresh = url.searchParams.get('refresh') === 'true';
+    // ?auto=true: the app's own "this looks out of date" refresh. It only wakes the car within the
+    // daily budget and not at night; otherwise it gets Hyundai's saved copy and the reason.
+    const auto = url.searchParams.get('auto') === 'true';
+    const skipped = refresh && auto ? autoRefreshBlocked() : null;
+    if (skipped) refresh = false;
+    const extra = () => ({ car_wakeups_24h: wakeups24h().length, ...(skipped ? { refresh_skipped: skipped } : {}) });
+    if (!refresh && statusCache && Date.now() - statusCache.at < CFG.statusCacheSec * 1000) return send(res, 200, { ...withKnown(statusCache.value), ...extra() });
+    // Two "ask the car" requests within a minute (an automatic one and a tap): answer both with one.
+    if (refresh && liveCache && Date.now() - liveCache.at < 60000) return send(res, 200, { ...withKnown(liveCache.value), ...extra() });
+    const value = await withCar(async () => {
+      wakeIsAuto = refresh && auto;   // set inside the queue, so only this read is marked automatic
+      try { return await bl.status({ refresh }); } finally { wakeIsAuto = false; }
+    });
     statusCache = { at: Date.now(), value };
-    send(res, 200, withKnown(value));
+    if (refresh) liveCache = { at: Date.now(), value };
+    send(res, 200, { ...withKnown(value), ...extra() });
   }],
   ['GET', /^\/v1\/location$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.location()))],
   ['GET', /^\/v1\/charge-limit$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.chargeLimits()))],
@@ -630,7 +703,10 @@ server.listen(CFG.port, CFG.host, () => {
   if (!CFG.publicUrl) log('PUBLIC_URL not set: notifications will have no "Cancel auto-lock" button');
   if (!bl.loggedIn) log('Not logged in to BlueLink yet: POST /v1/auth/login with the admin token.');
 });
-if (CFG.guard.intervalMin > 0) setInterval(guardTick, CFG.guard.intervalMin * 60000).unref();
+if (CFG.guard.intervalMin > 0) {
+  setInterval(() => { if (guardDue()) { lastGuardAt = Date.now(); guardTick(); } },
+    Math.min(60000, CFG.guard.intervalMin * 60000, CFG.guard.idleMin * 60000)).unref();
+}
 
 process.on('unhandledRejection', (e) => log('unhandled rejection:', e?.stack || e));
 

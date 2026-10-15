@@ -424,7 +424,7 @@ class BlueLinkCA {
   }
 
   async location() {
-    const pAuth = await this.pAuth();
+    const pAuth = await this.pAuth({ fresh: true });
     const { json } = await this.call('fndmcr', {
       body: { pin: this.creds.pin },
       headers: { pAuth, from: 'SPA', Referer: this.host + '/remote/' },
@@ -450,9 +450,16 @@ class BlueLinkCA {
 
   // ------------------------------------------------------------ commands
 
-  async pAuth() {
+  /**
+   * PIN token. Each command gets a fresh one; the status polls that follow reuse it, because
+   * sending the PIN again on every poll multiplied our request count for nothing.
+   */
+  async pAuth({ fresh = false } = {}) {
+    const c = this._pAuth;
+    if (!fresh && c && Date.now() - c.at < 4 * 60_000) return c.value;
     const { json } = await this.call('vrfypin', { body: { pin: this.creds.pin } });
     if (!json.result?.pAuth) throw new BlueLinkError('PIN verification failed — check your 4-digit BlueLink PIN.', '7445');
+    this._pAuth = { value: json.result.pAuth, at: Date.now() };
     return json.result.pAuth;
   }
 
@@ -461,17 +468,23 @@ class BlueLinkCA {
    * @returns {Promise<{status:'success'|'failed'|'timeout'|'sent', transactionId:string, detail?:string}>}
    */
   async command(endpoint, body, { wait = true, timeout = 120, extraHeaders = {}, onProgress } = {}) {
-    const pAuth = await this.pAuth();
+    const pAuth = await this.pAuth({ fresh: true });
     const { headers } = await this.call(endpoint, { body: { ...body, pin: this.creds.pin }, headers: { pAuth, ...extraHeaders } });
     const tid = headers.get('transactionId');
     if (!tid) throw new BlueLinkError('Hyundai accepted the request but returned no transaction id.', 'HTTP');
     if (!wait) return { status: 'sent', transactionId: tid };
 
+    // Ask how it went at a gentle, slowing pace (5 s, 7, 9, then every 10 s): the car usually
+    // answers within 10–30 s, and fewer requests keep us clear of Hyundai's rate limits.
     const deadline = Date.now() + timeout * 1000;
-    while (Date.now() < deadline) {
-      await sleep(this.pollMs);
-      const p = await this.pAuth();
-      const { json } = await this.call('rmtsts', { headers: { transactionId: tid, pAuth: p } }, { allowFail: true });
+    for (let n = 0; Date.now() < deadline; n++) {
+      await sleep(Math.min(this.pollMs * (1 + 0.4 * n), Math.max(this.pollMs, 10_000)));
+      const poll = (p) => this.call('rmtsts', { headers: { transactionId: tid, pAuth: p } }, { allowFail: true });
+      let { json } = await poll(await this.pAuth());
+      if (json.responseHeader?.responseCode === 1) {
+        // Maybe just our reused PIN token expiring: try once with a fresh one before calling it failed.
+        ({ json } = await poll(await this.pAuth({ fresh: true })));
+      }
       if (json.responseHeader?.responseCode === 1) {
         return { status: 'failed', transactionId: tid, detail: json.error?.errorDesc || json.error?.errorCode };
       }

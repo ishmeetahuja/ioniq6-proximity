@@ -72,7 +72,7 @@ class Prefs(c: Context) {
 
     /** Car status on the home screen: refresh at most every N minutes (0 = only when I tap). */
     var statusEveryMin: Int
-        get() = sp.getInt("statusEvery", 5)
+        get() = sp.getInt("statusEvery", 15).let { if (it in 1..4) 5 else it }
         set(v) { sp.edit().putInt("statusEvery", v).apply() }
     /** The last status the server sent, and when we got it, so a restart doesn't ask again. */
     var lastStatusJson: String?
@@ -254,6 +254,9 @@ data class CarStatus(
     val windowsOpen: Boolean = false,
     /** Set by the server when its own confirmed lock/unlock is newer than Hyundai's data. */
     val lockedAt: String? = null,
+    /** Why the server didn't ask the car on an automatic refresh ("night", "daily-budget", "recent"). */
+    val refreshSkipped: String? = null,
+    val wakeups24h: Int? = null,
 )
 
 /** Car controls. Calls block — run them off the main thread. */
@@ -277,9 +280,11 @@ object CarApi {
 
     private fun org.json.JSONObject.intOrNull(k: String): Int? = if (isNull(k) || !has(k)) null else optDouble(k).let { if (it.isNaN()) null else it.toInt() }
 
-    fun status(p: Prefs, live: Boolean = false): CarStatus {
+    /** auto = the app's own "looks out of date" refresh: the server only wakes the car within its daily budget. */
+    fun status(p: Prefs, live: Boolean = false, auto: Boolean = false): CarStatus {
+        val q = when { live && auto -> "?refresh=true&auto=true"; live -> "?refresh=true"; else -> "" }
         val r = try {
-            Api.request(p, "GET", "/v1/status" + if (live) "?refresh=true" else "", readTimeoutMs = if (live) 90_000 else 30_000)
+            Api.request(p, "GET", "/v1/status$q", readTimeoutMs = if (live) 90_000 else 30_000)
         } catch (e: Exception) { throw Failure("Couldn't reach the server") }
         val s = parse(json(r))
         p.lastStatusJson = r.body
@@ -316,6 +321,8 @@ object CarApi {
             odometerKm = j.intOrNull("odometer_km"),
             windowsOpen = (j.optJSONArray("windows_open")?.length() ?: 0) > 0,
             lockedAt = j.optString("locked_at").ifBlank { null },
+            refreshSkipped = j.optString("refresh_skipped").ifBlank { null },
+            wakeups24h = j.intOrNull("car_wakeups_24h"),
         )
     }
 

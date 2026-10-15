@@ -191,8 +191,8 @@ class SettingsActivity : Activity() {
             addView(row(dp(10), pillButton("Save") { saveHome() }, pillButton("Am I home?", Ui.GLACIER, Ui.ON_ACCENT) { checkHomeNow() }), Ui.lp(top = dp(16)))
         }
 
-        section(col, "Car status updates", "How often the home screen asks for the car's status while the app is open. These reads use Hyundai's saved copy, so they don't wake the car; the server also reuses one answer for a minute. Refresh on the home screen asks the car itself.") {
-            val opts = listOf(1, 5, 15, 30)
+        section(col, "Car status updates", "How often the home screen reads Hyundai's saved copy of the car's status while the app is open (this doesn't wake the car; the server also shares one read for 5 minutes). Asking the car itself happens when you tap Refresh, and automatically only a few times a day, never overnight.") {
+            val opts = listOf(5, 15, 30, 60)
             val pills = opts.map { m -> pillButton("$m min") {} }
             val manual = pillButton("Only when I tap Refresh") {}
             fun paint() {
