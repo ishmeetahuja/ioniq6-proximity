@@ -291,7 +291,7 @@ doctor() {
 
   say "Hyundai"
   local auth until calls since last
-  auth=$(api GET /v1/auth 2>/dev/null)
+  auth=$(api GET /v1/auth 2>/dev/null || true)
   if echo "$auth" | grep -q '"loggedIn": true'; then pass "signed in to BlueLink"
   else fail "not signed in to BlueLink right now (it signs in again by itself; if this stays, run: bash install.sh login)"; fi
   until=$(echo "$auth" | sed -n 's/.*"rateLimitedUntil": "\([^"]*\)".*/\1/p')
@@ -299,7 +299,7 @@ doctor() {
     echo "  note  Hyundai is rate-limiting this server; ordinary requests pause until $(date -d "$until" '+%-I:%M %p' 2>/dev/null || echo "$until")."
     echo "        Walk-away locks still retry on their own."
   fi
-  calls=$(docker compose exec -T api sh -c 'cat /data/hyundai.log.1 /data/hyundai.log 2>/dev/null' 2>/dev/null)
+  calls=$(docker compose exec -T api sh -c 'cat /data/hyundai.log.1 /data/hyundai.log 2>/dev/null; true' 2>/dev/null || true)
   if [ -n "$calls" ]; then
     since=$(date -u -d '-24 hours' +%FT%T 2>/dev/null || echo 0)
     echo "  Requests to Hyundai in the last 24 h (endpoint, count):"
