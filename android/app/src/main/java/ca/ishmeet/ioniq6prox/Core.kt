@@ -82,6 +82,29 @@ class Prefs(c: Context) {
         get() = sp.getLong("lastStatusAt", 0L)
         set(v) { sp.edit().putLong("lastStatusAt", v).apply() }
 
+    // What the phone itself knows, newer than Hyundai's saved copy can be (survives restarts):
+    /** When the phone last connected to / disconnected from the car's Bluetooth (drive start / park). */
+    var carOnAt: Long
+        get() = sp.getLong("carOnAt", 0L)
+        set(v) { sp.edit().putLong("carOnAt", v).apply() }
+    var carOffAt: Long
+        get() = sp.getLong("carOffAt", 0L)
+        set(v) { sp.edit().putLong("carOffAt", v).apply() }
+    /** Last lock/unlock the server confirmed for us (walk-away or the buttons). */
+    var lockConfirmedAt: Long
+        get() = sp.getLong("lockAt", 0L)
+        set(v) { sp.edit().putLong("lockAt", v).apply() }
+    var lockConfirmedLocked: Boolean
+        get() = sp.getBoolean("lockLocked", false)
+        set(v) { sp.edit().putBoolean("lockLocked", v).apply() }
+    var lockConfirmedBy: String
+        get() = sp.getString("lockBy", "") ?: ""
+        set(v) { sp.edit().putString("lockBy", v).apply() }
+    fun confirmLock(locked: Boolean, by: String) {
+        lockConfirmedAt = System.currentTimeMillis(); lockConfirmedLocked = locked; lockConfirmedBy = by
+        Status.changed()
+    }
+
     val configured: Boolean get() = serverUrl.startsWith("https://") && token.isNotBlank()
     val hasAdmin: Boolean get() = adminToken.isNotBlank()
 }
@@ -121,6 +144,12 @@ object Status {
     @Volatile var serverProblem: String? = null   // null = last contact worked
     @Volatile var pausedUntil: String? = null     // ISO time from the server, null = not paused
     @Volatile var autolockEnabled: Boolean = true
+    /** Walk-away lock in flight: shown on the home screen as "Locking…". */
+    @Volatile var locking = false
+    @Volatile var lockMessage: String? = null
+    /** Bumped whenever something the home screen shows changes, so it redraws. */
+    @Volatile var seq = 0
+    fun changed() { seq++ }
 
     private val lines = ArrayDeque<String>()
     private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
@@ -215,6 +244,8 @@ data class CarStatus(
     val aux12v: Int? = null,
     val odometerKm: Int? = null,
     val windowsOpen: Boolean = false,
+    /** Set by the server when its own confirmed lock/unlock is newer than Hyundai's data. */
+    val lockedAt: String? = null,
 )
 
 /** Car controls. Calls block — run them off the main thread. */
@@ -276,6 +307,7 @@ object CarApi {
             aux12v = j.intOrNull("aux_12v_percent"),
             odometerKm = j.intOrNull("odometer_km"),
             windowsOpen = (j.optJSONArray("windows_open")?.length() ?: 0) > 0,
+            lockedAt = j.optString("locked_at").ifBlank { null },
         )
     }
 

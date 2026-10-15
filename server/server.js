@@ -9,7 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { BlueLinkCA, BlueLinkError } = require('./lib/bluelink-ca');
+const { BlueLinkCA, BlueLinkError, parseStamp } = require('./lib/bluelink-ca');
 
 const VERSION = '2.1.0';
 const env = process.env;
@@ -44,6 +44,7 @@ const CFG = {
     checkFirst: bool(env.AUTOLOCK_CHECK_FIRST, false), // false = send lock straight away, inspect only on failure
     retrySec: num(env.AUTOLOCK_RETRY_SECONDS, 30),
     maxAttempts: num(env.AUTOLOCK_MAX_ATTEMPTS, 5),
+    rateLimitGiveUpMin: num(env.AUTOLOCK_RATE_LIMIT_GIVE_UP_MINUTES, 45), // keep retrying a refused lock this long
   },
   guard: {
     intervalMin: num(env.GUARD_INTERVAL_MINUTES, 0), // 0 = off
@@ -147,6 +148,16 @@ ${message}`, disable_notification: priority === 'low' || priority === 'min' };
 // ---------------------------------------------------------------- jobs (async commands)
 
 let statusCache = null;   // absorbs repeated app opens: at most one Hyundai status read per minute
+// What our own confirmed commands tell us. Hyundai's saved status only refreshes when the car
+// reports in, so after we lock or unlock we know better than it does until it catches up.
+let known = { locked: null, at: 0 };
+function withKnown(v) {
+  if (!v || known.locked === null) return v;
+  const upd = Date.parse(v.updated || '') || 0;
+  if (known.at <= upd) return v;
+  // A remote lock/unlock only goes through with the car switched off.
+  return { ...v, locked: known.locked, car_on: false, locked_at: new Date(known.at).toISOString(), locked_by: 'command' };
+}
 const jobs = new Map();
 function newJob(action, source) {
   const id = crypto.randomBytes(6).toString('hex');
@@ -162,7 +173,10 @@ function runJob(job, fn) {
       const r = await fn();
       Object.assign(job, { status: r.status || 'success', result: r });
     } catch (e) {
-      Object.assign(job, { status: 'error', error: e.message, code: e.code });
+      Object.assign(job, { status: 'error', error: e.message, code: e.code, until: e.until });
+    }
+    if (job.status === 'success' && (job.action === 'lock' || job.action === 'unlock')) {
+      known = { locked: job.action === 'lock', at: Date.now() };
     }
     job.finishedAt = new Date().toISOString();
     statusCache = null;   // the car just changed; next status read goes to Hyundai
@@ -185,7 +199,34 @@ function runJob(job, fn) {
  * AUTOLOCK_RETRY_SECONDS up to AUTOLOCK_MAX_ATTEMPTS, then alert; otherwise → lock.
  * "near" (phone reconnected to the car) cancels a pending lock. The server never auto-unlocks.
  */
-const AL = { phase: 'idle', events: [], timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, guardUnlockedSince: null };
+const AL = { phase: 'idle', events: [], timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, guardUnlockedSince: null, quiet: false, delayStarted: 0, delayNotified: false };
+let lastResult = null;   // outcome of the most recent auto-lock, so the phone can show it
+/** Records how this auto-lock ended (the phone polls for it by id). */
+function alFinish(outcome, detail) {
+  lastResult = { id: AL.nonce, outcome, detail: detail || null, source: AL.source, at: new Date().toISOString() };
+}
+function hhmm(t) { return new Date(t).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: process.env.TZ || 'America/Toronto' }); }
+/** Hyundai is rate-limiting: keep the lock pending and try again when allowed (never just drop it). */
+function alDelay(untilIso, why) {
+  if (!AL.delayStarted) AL.delayStarted = Date.now();
+  if (Date.now() - AL.delayStarted > CFG.autolock.rateLimitGiveUpMin * 60000) {
+    alEvent('gave-up', `${why}; Hyundai kept refusing for ${CFG.autolock.rateLimitGiveUpMin} min`);
+    alFinish('failed', 'Hyundai kept rate-limiting the server');
+    notify({ title: 'Car NOT locked', message: `Hyundai kept refusing requests for ${CFG.autolock.rateLimitGiveUpMin} minutes. Lock the car yourself.`, priority: 'high', tags: ['warning', 'car'] });
+    alReset();
+    return;
+  }
+  const at = Math.max(Date.parse(untilIso || '') || 0, Date.now() + 5000) + 3000;
+  AL.attempt = Math.max(0, AL.attempt - 1);   // a refused request isn't a real attempt
+  AL.phase = 'delayed';
+  AL.locksAt = at;
+  AL.timer = setTimeout(() => alCheck(), at - Date.now());
+  alEvent('delayed', `${why}; trying again at ${hhmm(at)}`);
+  if (!AL.delayNotified) {
+    AL.delayNotified = true;
+    notify({ title: 'Auto-lock delayed', message: `Hyundai is rate-limiting the server. I'll lock the car at about ${hhmm(at)} and keep trying. Lock it yourself if you can.`, priority: 'high', tags: ['warning', 'car'] });
+  }
+}
 function alEvent(type, detail) {
   AL.events.unshift({ at: new Date().toISOString(), type, ...(detail ? { detail } : {}) });
   AL.events.length = Math.min(AL.events.length, 50);
@@ -193,14 +234,16 @@ function alEvent(type, detail) {
 }
 function alReset() {
   clearTimeout(AL.timer);
-  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null });
+  Object.assign(AL, { phase: 'idle', timer: null, nonce: null, cancelled: false, locksAt: null, source: null, attempt: 0, checkFirst: null, quiet: false, delayStarted: 0, delayNotified: false });
 }
 function alPublic() {
   return {
     enabled: state.autolockEnabled,
     pausedUntil: state.pausedUntil > Date.now() ? new Date(state.pausedUntil).toISOString() : null,
     phase: AL.phase,
+    id: AL.nonce,
     source: AL.source,
+    last: lastResult,
     locksAt: AL.locksAt ? new Date(AL.locksAt).toISOString() : null,
     attempt: AL.attempt || undefined,
     graceSeconds: state.graceSec,
@@ -210,7 +253,7 @@ function alPublic() {
   };
 }
 
-function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null } = {}) {
+function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null, quiet = false } = {}) {
   if (!state.autolockEnabled) { alEvent('ignored', `away from ${source}: auto-lock disabled`); return { phase: 'disabled' }; }
   if (state.pausedUntil > Date.now()) { alEvent('ignored', `away from ${source}: paused`); return { phase: 'paused', pausedUntil: new Date(state.pausedUntil).toISOString() }; }
   if (AL.phase !== 'idle') { alEvent('away', `${source} (already ${AL.phase})`); return alPublic(); }
@@ -218,12 +261,13 @@ function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null
   AL.phase = 'pending';
   AL.source = source;
   AL.checkFirst = checkFirst; // per-event override of state.checkFirst (null = use the setting)
+  AL.quiet = quiet;           // the phone shows the result itself; ntfy only for problems
   AL.nonce = crypto.randomBytes(16).toString('hex');
   AL.locksAt = Date.now() + graceSec * 1000;
   AL.timer = setTimeout(() => alCheck(), graceSec * 1000);
   alEvent('away', `${source}; locking in ${graceSec}s`);
 
-  if (graceSec > 0) { // with no wait there's nothing to cancel
+  if (graceSec > 0 && !quiet) { // with no wait there's nothing to cancel
     const actions = CFG.publicUrl ? [{ label: 'Cancel auto-lock', url: `${CFG.publicUrl}/v1/autolock/cancel/${AL.nonce}` }] : [];
     notify({
       title: 'Auto-lock armed',
@@ -235,8 +279,9 @@ function alAway(source = 'phone', { graceSec = state.graceSec, checkFirst = null
 }
 
 function alNear(source = 'phone') {
-  if (AL.phase === 'pending' || AL.phase === 'retrying') {
+  if (AL.phase === 'pending' || AL.phase === 'retrying' || AL.phase === 'delayed') {
     alEvent('cancelled', `back near the car (${source})`);
+    alFinish('cancelled', 'back near the car');
     alReset();
   } else if (AL.phase === 'checking') {
     AL.cancelled = true;
@@ -250,7 +295,7 @@ function alNear(source = 'phone') {
 
 function alCancel(by) {
   if (AL.phase === 'idle') return false;
-  if (AL.phase === 'checking') AL.cancelled = true; else alReset();
+  if (AL.phase === 'checking') AL.cancelled = true; else { alFinish('cancelled', by); alReset(); }
   alEvent('cancelled', by);
   return true;
 }
@@ -264,37 +309,43 @@ function describeOpen(s) {
 
 async function alLock() {
   const job = newJob('lock', `autolock:${AL.source}`);
-  return runJob(job, () => bl.lock({ wait: true, timeout: CFG.commandTimeout }));
+  return runJob(job, () => bl.urgent(() => bl.lock({ wait: true, timeout: CFG.commandTimeout })));
 }
 
 async function alCheck() {
   AL.phase = 'checking';
   AL.attempt += 1;
   const attempt = AL.attempt;
+  const quietNote = (n) => { if (!AL.quiet) notify(n); };
+  const cancelled = () => { if (!AL.cancelled) return false; alFinish('cancelled', 'back near the car'); alReset(); return true; };
   try {
     if (attempt === 1 && !(AL.checkFirst ?? state.checkFirst)) {
-      if (AL.cancelled) { alReset(); return; }
+      if (cancelled()) return;
       const r = await alLock();
       if (r.status === 'success') {
         alEvent('locked', `via ${AL.source} (fast)`);
-        notify({ title: 'Car locked', message: `Locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
+        alFinish('locked');
+        quietNote({ title: 'Car locked', message: `Locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
         alReset();
         return;
       }
+      if (r.code === 'RATE_LIMIT') return alDelay(r.until, 'lock refused: Hyundai rate limit');
       alEvent('lock-refused', `${r.error || r.result?.detail || r.status}; checking why`);
     }
 
-    const s = await withCar(() => bl.rawStatus({ refresh: true }));
-    if (AL.cancelled) { alReset(); return; }
-    // Say so quietly, so a skipped lock never looks like auto-lock didn't work.
+    const s = await withCar(() => bl.urgent(() => bl.rawStatus({ refresh: true })));
+    if (cancelled()) return;
     if (s.engine) {
       alEvent('skipped', 'car is on');
-      notify({ title: 'Auto-lock: car is on', message: `Not locking (${AL.source}): the car is switched on.`, priority: 'min', tags: ['car'] });
+      alFinish('car-on');
+      quietNote({ title: 'Auto-lock: car is on', message: `Not locking (${AL.source}): the car is switched on.`, priority: 'min', tags: ['car'] });
       alReset(); return;
     }
     if (s.doorLock) {
       alEvent('skipped', 'already locked');
-      notify({ title: 'Car already locked', message: `You walked away (${AL.source}); it was already locked, so nothing was sent.`, priority: 'min', tags: ['lock', 'car'] });
+      alFinish('already-locked');
+      known = { locked: true, at: Date.now() };
+      quietNote({ title: 'Car already locked', message: `You walked away (${AL.source}); it was already locked, so nothing was sent.`, priority: 'min', tags: ['lock', 'car'] });
       alReset(); return;
     }
 
@@ -302,34 +353,42 @@ async function alCheck() {
     if (open.length) {
       if (attempt >= CFG.autolock.maxAttempts) {
         alEvent('gave-up', `${open.join(', ')} still open`);
+        alFinish('open', `${open.join(', ')} open`);
         notify({ title: 'Car NOT locked', message: `${open.join(', ')} still open after ${attempt} checks. Close it and lock manually.`, priority: 'high', tags: ['warning', 'car'] });
         alReset();
         return;
       }
       if (attempt === 1) notify({ title: 'Car unlocked — something is open', message: `${open.join(', ')} open. I'll keep checking and lock once it's closed.`, priority: 'default', tags: ['warning', 'car'] });
       alEvent('waiting', `${open.join(', ')} open; retry ${attempt + 1}/${CFG.autolock.maxAttempts} in ${CFG.autolock.retrySec}s`);
+      lastResult = { id: AL.nonce, outcome: 'waiting', detail: `${open.join(', ')} open`, source: AL.source, at: new Date().toISOString() };
       AL.phase = 'retrying';
       AL.locksAt = Date.now() + CFG.autolock.retrySec * 1000;
       AL.timer = setTimeout(() => alCheck(), CFG.autolock.retrySec * 1000);
       return;
     }
 
-    if (AL.cancelled) { alReset(); return; }
+    if (cancelled()) return;
     const r = await alLock();
     if (r.status === 'success') {
       alEvent('locked', `via ${AL.source}`);
-      notify({ title: 'Car locked', message: `Auto-locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
+      alFinish('locked');
+      quietNote({ title: 'Car locked', message: `Auto-locked after you walked away (${AL.source}).`, priority: 'default', tags: ['lock', 'car'] });
+    } else if (r.code === 'RATE_LIMIT') {
+      return alDelay(r.until, 'lock refused: Hyundai rate limit');
     } else {
       alEvent('lock-failed', r.error || r.result?.detail || r.status);
+      alFinish('failed', r.error || r.result?.detail || r.status);
       notify({ title: 'Auto-lock FAILED', message: `Lock command ${r.status}${r.error ? ': ' + r.error : ''}. Check the car.`, priority: 'high', tags: ['warning', 'car'] });
     }
     alReset();
   } catch (e) {
+    if (e.code === 'RATE_LIMIT' && !AL.cancelled) return alDelay(e.until, 'status check refused: Hyundai rate limit');
     alEvent('error', e.message);
     if (attempt < 3 && !AL.cancelled) {
       AL.phase = 'retrying';
       AL.timer = setTimeout(() => alCheck(), CFG.autolock.retrySec * 1000);
     } else {
+      alFinish('failed', e.message);
       notify({ title: 'Auto-lock error', message: `Couldn't check the car: ${e.message}`, priority: 'high', tags: ['warning', 'car'] });
       alReset();
     }
@@ -343,6 +402,8 @@ async function guardTick() {
   try {
     const s = await withCar(() => bl.rawStatus({ refresh: false }));
     if (s.engine || s.doorLock) { AL.guardUnlockedSince = null; return; }
+    // Hyundai's saved copy may predate a lock we confirmed ourselves.
+    if (known.locked && known.at > (Date.parse(parseStamp(s.lastStatusDate) || '') || 0)) { AL.guardUnlockedSince = null; return; }
     if (!AL.guardUnlockedSince) { AL.guardUnlockedSince = Date.now(); log('guard: car reported unlocked; will act if still unlocked next check'); return; }
     AL.guardUnlockedSince = null;
     alAway('safety check', { graceSec: CFG.guard.graceSec });
@@ -446,10 +507,10 @@ const ROUTES = [
   ['GET', /^\/v1\/vehicles$/, 'admin', async (req, res) => send(res, 200, await serial(() => bl.vehicles()))],
   ['GET', /^\/v1\/status$/, 'phone', async (req, res, url) => {
     const refresh = url.searchParams.get('refresh') === 'true';
-    if (!refresh && statusCache && Date.now() - statusCache.at < CFG.statusCacheSec * 1000) return send(res, 200, statusCache.value);
+    if (!refresh && statusCache && Date.now() - statusCache.at < CFG.statusCacheSec * 1000) return send(res, 200, withKnown(statusCache.value));
     const value = await withCar(() => bl.status({ refresh }));
     statusCache = { at: Date.now(), value };
-    send(res, 200, value);
+    send(res, 200, withKnown(value));
   }],
   ['GET', /^\/v1\/location$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.location()))],
   ['GET', /^\/v1\/charge-limit$/, 'admin', async (req, res) => send(res, 200, await withCar(() => bl.chargeLimits()))],
@@ -487,6 +548,7 @@ const ROUTES = [
     const opts = {};
     if (g !== undefined && g !== null) opts.graceSec = Number(g);
     if (typeof body.checkFirst === 'boolean') opts.checkFirst = body.checkFirst;
+    if (body.quiet === true) opts.quiet = true;
     send(res, 202, alAway(source, opts));
   }],
   ['PUT', /^\/v1\/autolock\/settings$/, 'admin', (req, res, url, body) => {

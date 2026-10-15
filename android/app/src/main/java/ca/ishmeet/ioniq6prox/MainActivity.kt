@@ -52,6 +52,8 @@ class MainActivity : Activity() {
     private lateinit var art: CarArtView
     private lateinit var stateWord: TextView
     private lateinit var meta: TextView
+    private lateinit var note: TextView
+    private var lastSeq = -1
     private lateinit var updated: TextView
     private lateinit var chips: LinearLayout
     private lateinit var autoChip: TextView
@@ -105,7 +107,12 @@ class MainActivity : Activity() {
     }
 
     private val ticker = object : Runnable {
-        override fun run() { renderAutoLock(); maybeRefresh(); handler.postDelayed(this, 1_000) }
+        override fun run() {
+            renderAutoLock()
+            if (Status.seq != lastSeq) { lastSeq = Status.seq; renderCar() }
+            maybeRefresh()
+            handler.postDelayed(this, 1_000)
+        }
     }
 
     /**
@@ -267,6 +274,7 @@ class MainActivity : Activity() {
         col.addView(art, Ui.lp(top = dp(18)))
         stateWord = text("…", 46f, Ui.MUTED, Ui.display).apply { letterSpacing = -0.01f }
         meta = text("", 16f, Ui.MUTED)
+        note = text("", 14f, Ui.MUTED)
         updated = text("", 13f, Ui.FAINT).apply {
             gravity = Gravity.CENTER_VERTICAL
             compoundDrawablePadding = dp(6)
@@ -284,6 +292,7 @@ class MainActivity : Activity() {
                 orientation = LinearLayout.VERTICAL
                 addView(stateWord)
                 addView(meta, Ui.lp(top = dp(6)))
+                addView(note, Ui.lp(top = dp(6)))
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(updated)
         }, Ui.lp(top = dp(2)))
@@ -370,13 +379,9 @@ class MainActivity : Activity() {
         else { title.text = "IONIQ 6"; subtitle.text = v ?: (prefs.carName ?: "") }
         subtitle.visibility = if (subtitle.text.isNullOrBlank()) View.GONE else View.VISIBLE
 
-        val (word, color) = when {
-            c == null -> (if (carError != null) "No contact" else if (prefs.configured) "Checking…" else "Not set up") to Ui.FAINT
-            c.carOn -> "Car on" to Ui.GLACIER
-            c.locked == true -> "Locked" to Ui.GLACIER
-            c.locked == false -> "Unlocked" to Ui.AMBER
-            else -> "Unknown" to Ui.FAINT
-        }
+        val (word, color, why) = truth(c)
+        note.text = why ?: ""
+        note.visibility = if (why.isNullOrBlank()) View.GONE else View.VISIBLE
         stateWord.text = word
         stateWord.setTextColor(if (color == Ui.FAINT) Ui.MUTED else color)
         art.glowColor = color
@@ -394,7 +399,7 @@ class MainActivity : Activity() {
                     c.charging -> part("Charging" + (c.chargeMinutesLeft?.let { ", ${fmtMinutes(it)} left" } ?: ""), Ui.GLACIER)
                     c.pluggedIn -> part("Plugged in", Ui.MUTED)
                 }
-                if (c.climateOn) part("Climate ${c.climateSetC?.let { fmtTemp(it) } ?: "on"}", Ui.MUTED)
+                if (c.climateOn && !stale(c)) part("Climate ${c.climateSetC?.let { fmtTemp(it) } ?: "on"}", Ui.MUTED)
             }
         }
         updated.text = c?.updated?.let { fmtUpdated(it) } ?: "Refresh"
@@ -405,13 +410,61 @@ class MainActivity : Activity() {
         if (c != null && c.open.isNotEmpty()) openChip.setChip(c.open.joinToString(", ").replaceFirstChar { it.uppercase() } + " open", Ui.AMBER)
     }
 
+    /**
+     * The car's state from everything we know, newest wins: the phone's own view of the car's
+     * Bluetooth (driving / parked), locks the server confirmed, then Hyundai's saved copy, which
+     * only refreshes when the car reports in and is often older than the other two.
+     */
+    private fun truth(c: CarStatus?): Triple<String, Int, String?> {
+        val upd = c?.updated?.let { utcMillis(it) } ?: 0L
+        val onAt = prefs.carOnAt
+        val offAt = prefs.carOffAt
+        val serverLockAt = c?.lockedAt?.let { utcMillis(it) } ?: 0L
+        val mine = prefs.lockConfirmedAt >= serverLockAt
+        val lockAt = if (mine) prefs.lockConfirmedAt else serverLockAt
+        val locked = if (mine) prefs.lockConfirmedLocked else c?.locked == true
+        val by = if (mine) prefs.lockConfirmedBy else ""
+        val driving = Status.running && Status.carConnected == true && onAt >= offAt
+        return when {
+            Status.locking -> Triple("Locking…", Ui.GLACIER, Status.lockMessage?.takeIf { !it.startsWith("Locking") })
+            driving -> Triple("Driving", Ui.GLACIER, "Connected to the car's Bluetooth")
+            // a lock/unlock confirmed after the last drive began and newer than Hyundai's data
+            lockAt > 0 && lockAt > onAt && lockAt > upd ->
+                Triple(if (locked) "Locked" else "Unlocked", if (locked) Ui.GLACIER else Ui.AMBER,
+                    (if (locked) "Locked" else "Unlocked") + " at ${clock(lockAt)}" + (if (by.isNotBlank()) " by $by" else ""))
+            c == null -> Triple(if (carError != null) "No contact" else if (prefs.configured) "Checking…" else "Not set up", Ui.FAINT, null)
+            // you parked after Hyundai's data was taken, so "car on"/"locked" from it is out of date
+            offAt > upd && offAt >= onAt -> Triple("Parked", Ui.TEXT, "Parked at ${clock(offAt)}. Not locked by the app yet")
+            c.carOn -> Triple("Car on", Ui.GLACIER, null)
+            c.locked == true -> Triple("Locked", Ui.GLACIER, null)
+            c.locked == false -> Triple("Unlocked", Ui.AMBER, null)
+            else -> Triple("Unknown", Ui.FAINT, null)
+        }
+    }
+
+    /** Hyundai's data was taken before your latest drive or park, so its car-on/climate is out of date. */
+    private fun stale(c: CarStatus): Boolean {
+        val upd = c.updated?.let { utcMillis(it) } ?: return false
+        return prefs.carOnAt > upd || prefs.carOffAt > upd
+    }
+
+    private fun utcMillis(s: String): Long = try {
+        if (s.endsWith("Z")) java.time.Instant.parse(s).toEpochMilli()
+        else java.time.LocalDateTime.parse(s.replace(' ', 'T')).toInstant(java.time.ZoneOffset.UTC).toEpochMilli()
+    } catch (_: Exception) { 0L }
+
+    private fun clock(ms: Long): String =
+        java.time.Instant.ofEpochMilli(ms).atZone(java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("h:mm a"))
+
     private fun renderCards(c: CarStatus?) {
         if (!::climateCard.isInitialized) return
         // Climate
         val set = c?.climateSetC ?: prefs.climateTemp.toDouble()
         climateCard.detail("Set to ${fmtTemp(set)}C")
-        climateCard.big.text = when { c == null -> "–"; c.climateOn -> "On"; else -> "Off" }
-        climateCard.bigColor = if (c?.climateOn == true) Ui.GLACIER else Ui.TEXT
+        val climateKnown = c != null && !stale(c)
+        climateCard.big.text = when { !climateKnown -> "–"; c!!.climateOn -> "On"; else -> "Off" }
+        climateCard.bigColor = if (climateKnown && c!!.climateOn) Ui.GLACIER else Ui.TEXT
+        if (c != null && !climateKnown) climateCard.detail("Not known since you drove. Refresh to ask the car")
         // Vehicle health
         val issues = c?.let { issues(it) } ?: emptyList()
         vehicleCard.detail(when {
@@ -542,7 +595,7 @@ class MainActivity : Activity() {
     }
 
     private fun doLock() = runCommand(lockTile, "Locking…", "Locked", needsAdmin = false, after = { ok ->
-        if (ok) { car = car?.copy(locked = true); renderCar() }
+        if (ok) { prefs.confirmLock(true, "you"); renderCar() }
     }) { CarApi.command(prefs, "POST", "/v1/lock", needsAdmin = false) }
 
     private fun confirmUnlock() {
@@ -562,7 +615,7 @@ class MainActivity : Activity() {
                     d.dismiss()
                     val pause = alsoPause.isChecked
                     runCommand(unlockTile, "Unlocking…", "Unlocked", needsAdmin = true, after = { ok ->
-                        if (ok) { car = car?.copy(locked = false); renderCar() }
+                        if (ok) { prefs.confirmLock(false, "you"); renderCar() }
                     }) {
                         if (pause) Api.pause(prefs, 120)
                         CarApi.command(prefs, "POST", "/v1/unlock")

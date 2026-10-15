@@ -120,20 +120,39 @@ class BlueLinkCA {
   }
 
   coolDown(seconds, why) {
-    const ms = Math.max(this.minCooldownMs, (Number(seconds) || 0) * 1000);
-    this.session.cooldownUntil = Date.now() + ms;
+    // Two clocks: Cloudflare's own wait (retry_after, at least 30 s), and our longer, polite pause
+    // for everything that can wait. A lock (urgent) only has to respect the first.
+    const hard = Math.max(Math.min(30_000, this.minCooldownMs), (Number(seconds) || 0) * 1000);
+    this.session.hardCooldownUntil = Date.now() + hard;
+    this.session.cooldownUntil = Date.now() + Math.max(this.minCooldownMs, hard);
     this.save();
-    this.warn(`${why}: not contacting Hyundai until ${new Date(this.session.cooldownUntil).toISOString()}`);
+    this.warn(`${why}: not contacting Hyundai until ${new Date(this.session.cooldownUntil).toISOString()} (locks may retry after ${new Date(this.session.hardCooldownUntil).toISOString()})`);
   }
 
-  rateLimitError() {
-    const until = new Date(this.session.cooldownUntil);
+  /** Runs fn as urgent (locking the car): allowed again as soon as Cloudflare's own wait is over. */
+  async urgent(fn) {
+    const was = this.isUrgent;
+    this.isUrgent = true;
+    try { return await fn(); } finally { this.isUrgent = was; }
+  }
+
+  /** ms timestamp until which this call may not contact Hyundai, or 0. */
+  blockedUntil() {
+    const t = (this.isUrgent ? this.session.hardCooldownUntil : this.session.cooldownUntil) || 0;
+    return t > Date.now() ? t : 0;
+  }
+
+  rateLimitError(untilMs = this.session.cooldownUntil) {
+    const until = new Date(untilMs);
     const hhmm = until.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: process.env.TZ || 'America/Toronto' });
-    return new BlueLinkError(`Hyundai is rate-limiting this server, so it's pausing requests until about ${hhmm}. It recovers on its own.`, 'RATE_LIMIT');
+    const e = new BlueLinkError(`Hyundai is rate-limiting this server, so it's pausing requests until about ${hhmm}. It recovers on its own${this.isUrgent ? '' : '; walk-away locks still go through'}.`, 'RATE_LIMIT');
+    e.until = until.toISOString();
+    return e;
   }
 
   async raw(endpoint, { body, headers = {} } = {}) {
-    if (this.cooldownUntil) throw this.rateLimitError();
+    const blocked = this.blockedUntil();
+    if (blocked) throw this.rateLimitError(blocked);
     let lastErr;
     for (let attempt = 0, delay = 2000; attempt < 4; attempt++, delay *= 2) {
       try {
@@ -150,7 +169,7 @@ class BlueLinkCA {
           const ra = (json && (json.retry_after ?? json.retryAfter)) || res.headers.get('retry-after');
           if (json) this.warn(`${endpoint}: unexpected reply (HTTP 429) ${BlueLinkCA.mask(json).slice(0, 500)}`);
           this.coolDown(ra, `${endpoint}: rate-limited by Hyundai (HTTP 429)`);
-          throw this.rateLimitError();
+          throw this.rateLimitError(this.blockedUntil() || this.session.cooldownUntil);
         }
         if (json === undefined) {
           if (res.status === 403 || /cloudflare|cf-ray/i.test(text)) {

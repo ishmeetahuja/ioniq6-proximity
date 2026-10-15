@@ -32,6 +32,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
+import android.os.VibrationEffect
+import android.os.VibratorManager
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -75,6 +77,12 @@ class ProximityService : Service() {
         private const val ALERT_CHANNEL = "alerts"
         private const val NOTIF_ID = 1
         private const val ALERT_ID = 2
+        private const val LOCK_ID = 3
+        private const val LOCK_CHANNEL = "lock"
+        // vibration patterns (off, on, off, on…) in ms
+        private val BUZZ_SENT = longArrayOf(0, 70, 90, 70)            // two taps: lock sent
+        private val BUZZ_LOCKED = longArrayOf(0, 220)                  // one firm buzz: locked
+        private val BUZZ_PROBLEM = longArrayOf(0, 450, 180, 450, 180, 450)  // long ×3: NOT locked
 
         private const val SETTLE_MS = 10_000L        // ignore tag hiccups right after parking
         private const val LINK_HOLD_MS = 5_000L      // link must stay down this long to count as "gone"
@@ -118,6 +126,8 @@ class ProximityService : Service() {
     private lateinit var prefs: Prefs
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var net: ExecutorService
+    private lateinit var watch: ExecutorService   // follows a sent lock until the server reports the result
+    @Volatile private var watchGen = 0
     private var gatt: BluetoothGatt? = null
     private var gattIsDirect = false
 
@@ -157,6 +167,7 @@ class ProximityService : Service() {
         super.onCreate()
         prefs = Prefs(this)
         net = Executors.newSingleThreadExecutor()
+        watch = Executors.newSingleThreadExecutor()
         createChannels()
         try {
             startForeground(NOTIF_ID, buildNotif("Starting…"), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
@@ -192,6 +203,7 @@ class ProximityService : Service() {
         try { gatt?.close() } catch (_: SecurityException) {}
         gatt = null
         if (::net.isInitialized) net.shutdown()
+        if (::watch.isInitialized) watch.shutdownNow()
         Status.running = false
         Status.mode = "Stopped"
         Status.espConnected = false
@@ -250,6 +262,7 @@ class ProximityService : Service() {
 
     private fun onCarConnected() {
         Status.carConnected = true
+        prefs.carOnAt = now(); Status.changed()
         homeCheckUntil = 0
         stopScan()
         if (mode == Mode.DRIVING) return
@@ -259,6 +272,7 @@ class ProximityService : Service() {
 
     private fun onCarDisconnected() {
         Status.carConnected = false
+        prefs.carOffAt = now(); Status.changed()
         arm("car Bluetooth disconnected")
     }
 
@@ -363,6 +377,9 @@ class ProximityService : Service() {
 
     /** One second of home logic: start visits, and lock once after each. */
     private fun homeTick(t: Long, atCar: Boolean) {
+        // The tag lost power at full signal: you're most likely starting the car, so you're still
+        // at it. Don't count that as walking away (the car's Bluetooth takes over in a moment).
+        if (!espConnected && dropWasPowerCut && linkDownSince > 0 && t - linkDownSince < POWERCUT_WAIT_MS) lastAtCarAt = t
         if (atCar) {
             if (atCarSince == 0L) atCarSince = t
             if (!visiting && t - atCarSince >= VISIT_MS) {
@@ -385,12 +402,11 @@ class ProximityService : Service() {
             // you locked yourself isn't sent a pointless command.
             // And if the tag lost power at full signal (you may have started the car), let the
             // server check too: it skips the lock when the car is on.
-            val fast = visitIsParking && !armedByProximity && !dropWasPowerCut
             lastAwayAt = t
             setMode(Mode.HOME, "away from the car ${prefs.homeDelaySec}s — locking once")
-            val body = if (fast) """{"source":"home","graceSeconds":0}"""
-                       else """{"source":"home","graceSeconds":0,"checkFirst":true}"""
-            send("/v1/autolock/away", body, "away")
+            // Lock straight away (harmless if it's already locked). Only after a power cut (car
+            // maybe running) does the server check first; it skips the lock if the car is on.
+            lockAway("home", "You left the car at home", checkFirst = dropWasPowerCut)
         }
     }
 
@@ -537,7 +553,7 @@ class ProximityService : Service() {
                     awaysThisStop++
                     stopScan()
                     setMode(Mode.AWAY, "ESP32 not reachable — using car Bluetooth only")
-                    send("/v1/autolock/away", """{"source":"car-bluetooth"}""", "away")
+                    lockAway("car-bluetooth", "You parked (ESP32 not found)", useServerGrace = true)
                     return
                 }
                 val settled = t - parkedAt > SETTLE_MS
@@ -551,7 +567,7 @@ class ProximityService : Service() {
                                 powerCutHandled = true
                                 awaysThisStop++
                                 setMode(Mode.AWAY, "ESP32 lost power and car Bluetooth never came back")
-                                send("/v1/autolock/away", """{"source":"esp32-power-lost","checkFirst":true}""", "away")
+                                lockAway("esp32-power-lost", "ESP32 lost power and the car's Bluetooth never came back", checkFirst = true)
                             }
                         } else if (t - linkDownSince > LINK_HOLD_MS) {
                             walkedAway("ESP32 out of range")
@@ -597,19 +613,135 @@ class ProximityService : Service() {
         }
         setMode(Mode.AWAY, reason)
         lastAwayAt = now()
-        // First walk-away after a drive: lock immediately (the tag already proves you left).
-        // Otherwise (armed by proximity, or a repeat in the same stop): have the server check
-        // first, so an already-locked car gets no redundant lock.
-        val body = if (awaysThisStop == 1 && !armedByProximity) """{"source":"esp32","graceSeconds":0}"""
-                   else """{"source":"esp32","graceSeconds":0,"checkFirst":true}"""
-        send("/v1/autolock/away", body, "away")
+        // Lock straight away: harmless if it's already locked, and one command costs Hyundai less
+        // than waking the car to check first.
+        lockAway("esp32", "You walked away")
+    }
+
+    // ------------------------------------------------------------------ lock feedback
+
+    /**
+     * Sends "lock" and follows it to the end: a double tap + "Locking your car…" now, then a firm
+     * buzz + "Car locked" (or a long buzz + what went wrong) when the server reports the result.
+     */
+    private fun lockAway(source: String, why: String, checkFirst: Boolean = false, useServerGrace: Boolean = false) {
+        val gen = ++watchGen
+        Status.locking = true
+        Status.lockMessage = "Locking your car…"
+        Status.changed()
+        buzz(BUZZ_SENT)
+        lockNotif("Locking your car…", why, problem = false)
+        val json = buildString {
+            append("""{"source":"$source","quiet":true""")
+            if (!useServerGrace) append(""","graceSeconds":0""")
+            if (checkFirst) append(""","checkFirst":true""")
+            append("}")
+        }
+        send("/v1/autolock/away", json, "away") { body -> follow(gen, body) }
+    }
+
+    /** Runs on the network thread with the server's reply to "away"; polls for the outcome. */
+    private fun follow(gen: Int, body: String) {
+        val first = try { org.json.JSONObject(body) } catch (_: Exception) { null }
+        when (first?.optString("phase")) {
+            "disabled" -> { handler.post { lockDone(gen, "Not locked: auto-lock is off on the server", null, problem = true) }; return }
+            "paused" -> { handler.post { lockDone(gen, "Not locked: auto-lock is paused", "Resume it in the app", problem = true) }; return }
+        }
+        val id = first?.optString("id").orEmpty()
+        watch.execute {
+            val start = now()
+            var delayShown = false
+            var waitingShown = ""
+            while (gen == watchGen && now() - start < 50 * 60_000L) {
+                try { Thread.sleep(if (now() - start < 3 * 60_000L) 3_000 else 30_000) } catch (_: InterruptedException) { return@execute }
+                val j = try {
+                    val r = Api.request(prefs, "GET", "/v1/autolock")
+                    if (r.code != 200) continue
+                    org.json.JSONObject(r.body)
+                } catch (_: Exception) { continue }
+                val last = j.optJSONObject("last")
+                if (last != null && (id.isEmpty() || last.optString("id") == id)) {
+                    val outcome = last.optString("outcome")
+                    val detail = last.optString("detail").takeIf { it.isNotBlank() && it != "null" }
+                    if (outcome == "waiting") {
+                        if (waitingShown != detail) {
+                            waitingShown = detail.orEmpty()
+                            handler.post { if (gen == watchGen) lockNotif("Waiting to lock", "${detail ?: "Something is open"}. It locks once it's closed.", problem = true) }
+                        }
+                        continue
+                    }
+                    handler.post { lockResult(gen, outcome, detail) }
+                    return@execute
+                }
+                if (j.optString("phase") == "delayed" && !delayShown) {
+                    delayShown = true
+                    val at = Ui.localTime(j.optString("locksAt").ifBlank { null })
+                    handler.post {
+                        if (gen != watchGen) return@post
+                        Status.lockMessage = "Lock delayed until $at"; Status.changed()
+                        lockNotif("Lock delayed until $at", "Hyundai is busy; the server keeps trying. Lock it yourself if you can.", problem = true)
+                        buzz(BUZZ_PROBLEM)
+                    }
+                }
+            }
+            handler.post { if (gen == watchGen) lockDone(gen, "Lock sent, no confirmation yet", "Check the car's status in the app", problem = true) }
+        }
+    }
+
+    private fun lockResult(gen: Int, outcome: String, detail: String?) {
+        when (outcome) {
+            "locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "Locked as you walked away", problem = false) }
+            "already-locked" -> { prefs.confirmLock(true, "walk-away"); lockDone(gen, "Car locked", "It was already locked", problem = false) }
+            "car-on" -> lockDone(gen, "Not locked: the car is on", null, problem = false, quiet = true)
+            "cancelled" -> lockDone(gen, "Lock cancelled", "You came back to the car", problem = false, quiet = true)
+            "open" -> lockDone(gen, "Car NOT locked", "${detail ?: "Something is open"}. Close it and lock it.", problem = true)
+            else -> lockDone(gen, "Car NOT locked", detail ?: "The lock didn't go through. Lock it yourself.", problem = true)
+        }
+    }
+
+    private fun lockDone(gen: Int, title: String, text: String?, problem: Boolean, quiet: Boolean = false) {
+        if (gen != watchGen) return
+        Status.locking = false
+        Status.lockMessage = null
+        Status.changed()
+        Status.log("Lock result: $title" + (text?.let { " — $it" } ?: ""))
+        buzz(if (problem) BUZZ_PROBLEM else if (quiet) longArrayOf(0, 60) else BUZZ_LOCKED)
+        lockNotif(title, text ?: java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(java.util.Date()), problem, done = !problem)
+    }
+
+    private fun buzz(pattern: LongArray) {
+        try {
+            getSystemService(VibratorManager::class.java)?.defaultVibrator?.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } catch (_: Exception) {}
+    }
+
+    /** One notification for the lock, updated in place: sending → result. Pops up on screen. */
+    private fun lockNotif(title: String, text: String, problem: Boolean, done: Boolean = false) {
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val n = Notification.Builder(this, LOCK_CHANNEL)
+            .setSmallIcon(if (problem) android.R.drawable.stat_notify_error else android.R.drawable.ic_lock_lock)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
+            .setColor(if (problem) Ui.CORAL else Ui.GLACIER)
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setContentIntent(open)
+            .apply { if (done) setTimeoutAfter(15 * 60_000L) }
+            .build()
+        getSystemService(NotificationManager::class.java)?.notify(LOCK_ID, n)
     }
 
     // ------------------------------------------------------------------ server calls
 
-    private fun send(path: String, json: String, label: String) {
-        if (!prefs.configured) { Status.log("Server not set up — skipped $label"); return }
+    private fun send(path: String, json: String, label: String, onOk: ((String) -> Unit)? = null) {
         val critical = label == "away"
+        val gen = watchGen
+        if (!prefs.configured) {
+            Status.log("Server not set up — skipped $label")
+            if (critical) lockDone(gen, "Car NOT locked", "The app isn't connected to your server yet (Settings).", problem = true)
+            return
+        }
         net.execute {
             var delay = 5_000L
             var alerted = false
@@ -619,11 +751,18 @@ class ProximityService : Service() {
                     Status.log("$label → HTTP ${r.code}")
                     if (r.code in 200..299) {
                         serverOk()
-                        if (alerted) handler.post { clearAlert() }
+                        onOk?.invoke(r.body)
                         return@execute
                     }
-                    if (r.code == 401) { serverProblem("server rejected the phone token"); return@execute }
-                    if (r.code in 400..499 && r.code != 429) return@execute  // our problem; retrying won't help
+                    if (r.code == 401) {
+                        serverProblem("server rejected the phone token")
+                        if (critical) handler.post { lockDone(gen, "Car NOT locked", "The server rejected the phone token. Check Settings.", problem = true) }
+                        return@execute
+                    }
+                    if (r.code in 400..499 && r.code != 429) {  // our problem; retrying won't help
+                        if (critical) handler.post { lockDone(gen, "Car NOT locked", "The server refused the request (HTTP ${r.code}).", problem = true) }
+                        return@execute
+                    }
                     serverProblem("server error HTTP ${r.code}")
                 } catch (e: Exception) {
                     serverProblem("can't reach the server (${e.javaClass.simpleName})")
@@ -631,13 +770,18 @@ class ProximityService : Service() {
                 }
                 if (critical && !alerted) {
                     alerted = true
-                    handler.post { alert("Auto-lock can't reach the server", "Still retrying. Lock the car yourself to be safe.") }
+                    handler.post {
+                        if (gen != watchGen) return@post
+                        Status.lockMessage = "Can't reach the server, retrying"; Status.changed()
+                        lockNotif("Can't reach the server", "Still trying to send the lock. Lock the car yourself to be safe.", problem = true)
+                        buzz(BUZZ_PROBLEM)
+                    }
                 }
                 try { Thread.sleep(delay) } catch (_: InterruptedException) { return@execute }
                 delay = (delay * 2).coerceAtMost(60_000)
             }
             Status.log("$label gave up after 12 tries")
-            if (critical) handler.post { alert("Auto-lock FAILED", "Couldn't reach the server. Check that the car is locked.") }
+            if (critical) handler.post { lockDone(gen, "Car NOT locked", "Couldn't reach the server. Lock the car yourself.", problem = true) }
         }
     }
 
@@ -702,6 +846,11 @@ class ProximityService : Service() {
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "Proximity monitor", NotificationManager.IMPORTANCE_LOW).apply {
             description = "Shows that walk-away auto-lock is running"
         })
+        nm.createNotificationChannel(NotificationChannel(LOCK_CHANNEL, "Walk-away lock", NotificationManager.IMPORTANCE_HIGH).apply {
+            description = "Locking your car… → Car locked (or what went wrong)"
+            enableVibration(false)   // the app vibrates itself, with a different pattern per result
+            setSound(null, null)
+        })
         nm.createNotificationChannel(NotificationChannel(ALERT_CHANNEL, "Auto-lock problems", NotificationManager.IMPORTANCE_HIGH).apply {
             description = "When the car might not have locked"
         })
@@ -726,22 +875,6 @@ class ProximityService : Service() {
             .setContentIntent(open)
             .addAction(Notification.Action.Builder(null, if (paused) "Resume" else "Pause 2 h", actionPi).build())
             .build()
-    }
-
-    private fun alert(title: String, text: String) {
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        val n = Notification.Builder(this, ALERT_CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_notify_error)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setAutoCancel(true)
-            .setContentIntent(open)
-            .build()
-        getSystemService(NotificationManager::class.java)?.notify(ALERT_ID, n)
-    }
-
-    private fun clearAlert() {
-        getSystemService(NotificationManager::class.java)?.cancel(ALERT_ID)
     }
 
     private fun now() = System.currentTimeMillis()
