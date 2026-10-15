@@ -73,6 +73,18 @@ class Prefs(c: Context) {
         get() = sp.getInt("homeDelay", 60)
         set(v) { sp.edit().putInt("homeDelay", v).apply() }
 
+    /** Car status on the home screen: refresh at most every N minutes (0 = only when I tap). */
+    var statusEveryMin: Int
+        get() = sp.getInt("statusEvery", 5)
+        set(v) { sp.edit().putInt("statusEvery", v).apply() }
+    /** The last status the server sent, and when we got it, so a restart doesn't ask again. */
+    var lastStatusJson: String?
+        get() = sp.getString("lastStatus", null)
+        set(v) { sp.edit().putString("lastStatus", v).apply() }
+    var lastStatusAt: Long
+        get() = sp.getLong("lastStatusAt", 0L)
+        set(v) { sp.edit().putLong("lastStatusAt", v).apply() }
+
     val configured: Boolean get() = serverUrl.startsWith("https://") && token.isNotBlank()
     val hasAdmin: Boolean get() = adminToken.isNotBlank()
 }
@@ -199,6 +211,13 @@ data class CarStatus(
     val open: List<String>,
     val climateOn: Boolean,
     val climateSetC: Double?,
+    val chargeLimitAc: Int? = null,
+    val chargeLimitDc: Int? = null,
+    val tireWarning: Boolean = false,
+    val washerLow: Boolean = false,
+    val aux12v: Int? = null,
+    val odometerKm: Int? = null,
+    val windowsOpen: Boolean = false,
 )
 
 /** Car controls. Calls block — run them off the main thread. */
@@ -226,7 +245,16 @@ object CarApi {
         val r = try {
             Api.request(p, "GET", "/v1/status" + if (live) "?refresh=true" else "", readTimeoutMs = if (live) 90_000 else 30_000)
         } catch (e: Exception) { throw Failure("Couldn't reach the server") }
-        val j = json(r)
+        val s = parse(json(r))
+        p.lastStatusJson = r.body
+        p.lastStatusAt = System.currentTimeMillis()
+        return s
+    }
+
+    /** The last status we stored, if any (shown straight away when the app opens). */
+    fun cached(p: Prefs): CarStatus? = try { p.lastStatusJson?.let { parse(org.json.JSONObject(it)) } } catch (_: Exception) { null }
+
+    private fun parse(j: org.json.JSONObject): CarStatus {
         val open = mutableListOf<String>()
         j.optJSONArray("doors_open")?.let { a -> for (i in 0 until a.length()) open += a.getString(i).replace(Regex("([A-Z])"), " $1").lowercase() + " door" }
         if (j.optBoolean("trunk_open")) open += "trunk"
@@ -244,6 +272,13 @@ object CarApi {
             open = open,
             climateOn = j.optBoolean("climate_on"),
             climateSetC = if (j.isNull("climate_set_c") || !j.has("climate_set_c")) null else j.optDouble("climate_set_c"),
+            chargeLimitAc = j.intOrNull("charge_limit_ac"),
+            chargeLimitDc = j.intOrNull("charge_limit_dc"),
+            tireWarning = j.optBoolean("tire_warning"),
+            washerLow = j.optBoolean("washer_fluid_low"),
+            aux12v = j.intOrNull("aux_12v_percent"),
+            odometerKm = j.intOrNull("odometer_km"),
+            windowsOpen = (j.optJSONArray("windows_open")?.length() ?: 0) > 0,
         )
     }
 

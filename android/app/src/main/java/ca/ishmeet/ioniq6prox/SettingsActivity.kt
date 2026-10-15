@@ -134,7 +134,7 @@ class SettingsActivity : Activity() {
             addView(text("Settings", 24f, Ui.TEXT, Ui.semibold), LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(14) })
         })
 
-        section(col, "Server", "The installer printed the address and the phone token. The admin token is in /opt/ioniq6/.env on the server.") {
+        section(col, "Server", "The installer printed the address and the phone token. The admin token is in the server's .env file (on Unraid: /mnt/user/appdata/ioniq6/.env).") {
             label("Server address")
             urlEdit = field("https://…sslip.io", prefs.serverUrl, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
             addView(urlEdit, Ui.lp(top = dp(6)))
@@ -189,6 +189,25 @@ class SettingsActivity : Activity() {
             delayEdit = field("60", prefs.homeDelaySec.toString(), InputType.TYPE_CLASS_NUMBER)
             addView(delayEdit, Ui.lp(top = dp(6)))
             addView(row(dp(10), pillButton("Save") { saveHome() }, pillButton("Am I home?", Ui.GLACIER, Ui.ON_ACCENT) { checkHomeNow() }), Ui.lp(top = dp(16)))
+        }
+
+        section(col, "Car status updates", "How often the home screen asks for the car's status while the app is open. These reads use Hyundai's saved copy, so they don't wake the car; the server also reuses one answer for a minute. Refresh on the home screen asks the car itself.") {
+            val opts = listOf(1, 5, 15, 30)
+            val pills = opts.map { m -> pillButton("$m min") {} }
+            val manual = pillButton("Only when I tap Refresh") {}
+            fun paint() {
+                fun style(b: TextView, sel: Boolean) {
+                    b.background = Ui.run { this@SettingsActivity.pressable(if (sel) alpha(GLACIER, 0.16f) else RAISED, dpf(999f), stroke = if (sel) dp(1) else 0, strokeColor = GLACIER) }
+                    b.setTextColor(if (sel) Ui.GLACIER else Ui.TEXT)
+                }
+                pills.forEachIndexed { i, b -> style(b, prefs.statusEveryMin == opts[i]) }
+                style(manual, prefs.statusEveryMin == 0)
+            }
+            pills.forEachIndexed { i, b -> b.setOnClickListener { prefs.statusEveryMin = opts[i]; paint(); bar.show("Every ${opts[i]} min while the app is open", Ui.GLACIER) } }
+            manual.setOnClickListener { prefs.statusEveryMin = 0; paint(); bar.show("Only when you tap Refresh", Ui.GLACIER) }
+            paint()
+            addView(row(dp(8), *pills.toTypedArray()), Ui.lp(top = dp(14)))
+            addView(manual, Ui.lp(top = dp(8)))
         }
 
         section(col, "Background and testing") {

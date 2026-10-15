@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.drawable.RippleDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -57,9 +59,11 @@ class MainActivity : Activity() {
     private lateinit var openChip: TextView
     private lateinit var lockTile: Tile
     private lateinit var unlockTile: Tile
-    private lateinit var climateTile: Tile
-    private lateinit var chargeTile: Tile
-    private lateinit var findTile: Tile
+    private lateinit var climateCard: Card
+    private lateinit var vehicleCard: Card
+    private lateinit var chargeCard: Card
+    private lateinit var chargeBar: ChargeBarView
+    private lateinit var findCard: Card
     private lateinit var runSwitch: Switch
     private lateinit var modeWord: TextView
     private lateinit var modeWhy: TextView
@@ -69,11 +73,12 @@ class MainActivity : Activity() {
     private var car: CarStatus? = null
     private var carError: String? = null
     private var busy = false            // one car command at a time
-    private var lastStatusAt = 0L
+    private var lastAttemptAt = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        car = CarApi.cached(prefs)   // show the last known state straight away
         darkWindow()
         buildUi()
         askPermissions()
@@ -83,10 +88,8 @@ class MainActivity : Activity() {
         super.onResume()
         art.photo = CarPhoto.load(this)
         handler.post(ticker)
-        if (prefs.configured) {
-            io.execute { Api.check(prefs) }
-            if (System.currentTimeMillis() - lastStatusAt > 60_000) loadStatus(live = false)
-        }
+        if (prefs.configured) io.execute { Api.check(prefs) }
+        maybeRefresh()
         render()
     }
 
@@ -101,32 +104,114 @@ class MainActivity : Activity() {
     }
 
     private val ticker = object : Runnable {
-        override fun run() { renderAutoLock(); handler.postDelayed(this, 1_000) }
+        override fun run() { renderAutoLock(); maybeRefresh(); handler.postDelayed(this, 1_000) }
+    }
+
+    /**
+     * Asks the server for the car's status at most every statusEveryMin minutes (Settings), counted
+     * from the last answer even across app restarts. 0 = only on Refresh (or once if we have nothing).
+     */
+    private fun maybeRefresh() {
+        if (!prefs.configured) return
+        val now = System.currentTimeMillis()
+        val every = prefs.statusEveryMin
+        if (every == 0 && car != null) return
+        val gap = (if (every == 0) 1 else every) * 60_000L
+        if (now - maxOf(prefs.lastStatusAt, lastAttemptAt) < gap) return
+        lastAttemptAt = now
+        loadStatus(live = false)
     }
 
     // ------------------------------------------------------------------ layout
 
-    private inner class Tile(icon: Icon.Kind, iconColor: Int, label: String, big: Boolean, onClick: () -> Unit) {
-        val icon = Icon(icon, iconColor, dp(24), knob = Ui.SURFACE)
-        val text = text(label, if (big) 17f else 13f, Ui.TEXT, if (big) Ui.semibold else Ui.medium)
-        val view: LinearLayout = LinearLayout(this@MainActivity).apply {
-            orientation = if (big) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            gravity = if (big) Gravity.CENTER_VERTICAL else Gravity.CENTER
-            background = pressable(Ui.SURFACE, dpf(if (big) 24f else 20f))
-            minimumHeight = dp(if (big) 76 else 84)
+    /** Anything that shows a command running inside itself, then confirms. */
+    private interface Control {
+        val view: View
+        fun busy(label: String)
+        fun done(ok: Boolean, label: String?)
+    }
+
+    private fun shape(r: Float) = Ui.rounded(Ui.SURFACE, r)
+    private fun ripple(fill: android.graphics.drawable.GradientDrawable, r: Float) =
+        RippleDrawable(ColorStateList.valueOf(Ui.alpha(Ui.TEXT, 0.14f)), fill, Ui.rounded(Color.WHITE, r))
+
+    /** Big Lock / Unlock button: icon becomes a spinning ring while it runs, flashes white when done. */
+    private inner class Tile(kind: Icon.Kind, private val iconColor: Int, private val label0: String, onClick: () -> Unit) : Control {
+        private val fill = shape(dpf(24f))
+        private val icon = Icon(kind, iconColor, dp(24), knob = Ui.SURFACE)
+        private val iconView = View(this@MainActivity).apply { background = icon }
+        private val ring = RingView(this@MainActivity, iconColor).apply { visibility = View.GONE }
+        private val text = text(label0, 17f, Ui.TEXT, Ui.semibold)
+        override val view: LinearLayout = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = ripple(fill, dpf(24f))
+            minimumHeight = dp(76)
             setPadding(dp(20), dp(12), dp(16), dp(12))
             isClickable = true
             isFocusable = true
             setOnClickListener { onClick() }
-            addView(View(context).apply { background = this@Tile.icon }, LinearLayout.LayoutParams(dp(24), dp(24)))
-            addView(this@Tile.text, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                if (big) marginStart = dp(12) else topMargin = dp(8)
-            })
+            addView(FrameLayout(context).apply {
+                addView(iconView, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
+                addView(ring, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+            }, LinearLayout.LayoutParams(dp(28), dp(28)))
+            addView(text, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { marginStart = dp(12) })
         }
-        private val label0 = label
-        fun busy(label: String?) {
-            text.text = label ?: label0
-            view.alpha = if (label != null) 0.6f else 1f
+        override fun busy(label: String) {
+            text.text = label
+            iconView.visibility = View.INVISIBLE
+            ring.start()
+        }
+        override fun done(ok: Boolean, label: String?) {
+            ring.stop()
+            iconView.visibility = View.VISIBLE
+            text.text = if (ok && label != null) label else label0
+            if (ok && label != null) handler.postDelayed({ text.text = label0 }, 1_600)
+            Motion.result(view, fill, Ui.SURFACE, ok) { f, ink ->
+                icon.setColor(Motion.blend(iconColor, ink, f))
+                text.setTextColor(Motion.blend(Ui.TEXT, ink, f))
+            }
+        }
+    }
+
+    /** A status card (climate, vehicle, charging, find): title, detail, a big word; ring in the corner while busy. */
+    private inner class Card(titleText: String, minH: Int, onClick: () -> Unit) : Control {
+        private val fill = shape(dpf(24f))
+        val title = text(titleText, 16f, Ui.TEXT, Ui.semibold)
+        val sub = text("", 14f, Ui.MUTED).apply { setLineSpacing(0f, 1.15f) }
+        val big = text("", 34f, Ui.TEXT, Ui.display)
+        var bigColor = Ui.TEXT
+            set(v) { field = v; big.setTextColor(v) }
+        val body: LinearLayout = LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(18), dp(18), dp(16))
+            addView(title)
+            addView(sub, Ui.lp(top = dp(5)))
+            addView(View(context), LinearLayout.LayoutParams(1, 0, 1f))
+            addView(big, Ui.lp(top = dp(14)))
+        }
+        private val ring = RingView(this@MainActivity, Ui.TEXT).apply { visibility = View.GONE }
+        private var busyLabel: String? = null
+        override val view: FrameLayout = FrameLayout(this@MainActivity).apply {
+            background = ripple(fill, dpf(24f))
+            minimumHeight = minH
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+            addView(body, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(ring, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP or Gravity.END).apply { topMargin = dp(16); marginEnd = dp(16) })
+        }
+        fun detail(t: CharSequence) { if (busyLabel == null) sub.text = t }
+        override fun busy(label: String) { busyLabel = label; sub.text = label; ring.start() }
+        override fun done(ok: Boolean, label: String?) {
+            busyLabel = null
+            ring.stop()
+            renderCar()
+            Motion.result(view, fill, Ui.SURFACE, ok) { f, ink ->
+                title.setTextColor(Motion.blend(Ui.TEXT, ink, f))
+                sub.setTextColor(Motion.blend(Ui.MUTED, ink, f))
+                big.setTextColor(Motion.blend(bigColor, ink, f))
+            }
         }
     }
 
@@ -216,13 +301,23 @@ class MainActivity : Activity() {
         }, Ui.lp(top = dp(16)))
 
         // controls
-        lockTile = Tile(Icon.Kind.LOCK, Ui.GLACIER, "Lock", true) { doLock() }
-        unlockTile = Tile(Icon.Kind.UNLOCK, Ui.AMBER, "Unlock", true) { confirmUnlock() }
+        lockTile = Tile(Icon.Kind.LOCK, Ui.GLACIER, "Lock") { doLock() }
+        unlockTile = Tile(Icon.Kind.UNLOCK, Ui.AMBER, "Unlock") { confirmUnlock() }
         col.addView(row(dp(10), lockTile.view, unlockTile.view), Ui.lp(top = dp(18)))
-        climateTile = Tile(Icon.Kind.CLIMATE, Ui.TEXT, "Climate", false) { climateSheet() }
-        chargeTile = Tile(Icon.Kind.CHARGE, Ui.TEXT, "Charging", false) { chargeSheet() }
-        findTile = Tile(Icon.Kind.FIND, Ui.TEXT, "Find car", false) { findCar() }
-        col.addView(row(dp(10), climateTile.view, chargeTile.view, findTile.view), Ui.lp(top = dp(10)))
+
+        // status cards
+        climateCard = Card("Climate", dp(150)) { climateSheet() }
+        vehicleCard = Card("Vehicle status", dp(150)) { vehicleSheet() }
+        col.addView(row(dp(10), climateCard.view, vehicleCard.view), Ui.lp(top = dp(10)))
+        chargeCard = Card("Charging", 0) { chargeSheet() }
+        chargeBar = ChargeBarView(this)
+        chargeCard.big.visibility = View.GONE
+        chargeCard.body.addView(chargeBar, Ui.lp(top = dp(16)))
+        col.addView(chargeCard.view, Ui.lp(top = dp(10)))
+        findCard = Card("Find car", 0) { findCar() }
+        findCard.big.visibility = View.GONE
+        findCard.detail("Opens where the car is in Maps")
+        col.addView(findCard.view, Ui.lp(top = dp(10)))
 
         // walk-away lock panel
         runSwitch = Switch(this).apply {
@@ -301,8 +396,49 @@ class MainActivity : Activity() {
         }
         updated.text = c?.updated?.let { fmtUpdated(it) } ?: "Refresh"
 
+        renderCards(c)
+
         openChip.visibility = if (c != null && c.open.isNotEmpty()) View.VISIBLE else View.GONE
         if (c != null && c.open.isNotEmpty()) openChip.setChip(c.open.joinToString(", ").replaceFirstChar { it.uppercase() } + " open", Ui.AMBER)
+    }
+
+    private fun renderCards(c: CarStatus?) {
+        if (!::climateCard.isInitialized) return
+        // Climate
+        val set = c?.climateSetC ?: prefs.climateTemp.toDouble()
+        climateCard.detail("Set to ${fmtTemp(set)}C")
+        climateCard.big.text = when { c == null -> "–"; c.climateOn -> "On"; else -> "Off" }
+        climateCard.bigColor = if (c?.climateOn == true) Ui.GLACIER else Ui.TEXT
+        // Vehicle health
+        val issues = c?.let { issues(it) } ?: emptyList()
+        vehicleCard.detail(when {
+            c == null -> "Tires, 12 V battery, fluids"
+            issues.isEmpty() -> "Tires · 12 V ${c.aux12v?.let { "$it%" } ?: "OK"} · fluids"
+            else -> issues.joinToString(" · ")
+        })
+        vehicleCard.big.text = when { c == null -> "–"; issues.isEmpty() -> "Normal"; else -> "Check" }
+        vehicleCard.bigColor = if (issues.isEmpty()) Ui.TEXT else Ui.AMBER
+        // Charging
+        chargeCard.title.text = when { c == null -> "Charging"; c.charging -> "Charging"; c.pluggedIn -> "Plugged in"; else -> "Unplugged" }
+        chargeCard.detail(when {
+            c == null -> "Charge level and limit"
+            else -> listOfNotNull(
+                c.battery?.let { "$it%" },
+                c.chargeLimitAc?.let { "limit $it%" },
+                if (c.charging) c.chargeMinutesLeft?.let { "${fmtMinutes(it)} left" } else null,
+            ).joinToString(" · ").replaceFirstChar { it.uppercase() }
+        })
+        chargeBar.level = c?.battery
+        chargeBar.limit = c?.chargeLimitAc
+        chargeBar.charging = c?.charging == true
+    }
+
+    private fun issues(c: CarStatus): List<String> = buildList {
+        if (c.tireWarning) add("Tire pressure low")
+        c.aux12v?.let { if (it < 60) add("12 V battery $it%") }
+        if (c.washerLow) add("Washer fluid low")
+        if (c.open.isNotEmpty()) add(c.open.joinToString(", ").replaceFirstChar { it.uppercase() } + " open")
+        if (c.windowsOpen) add("Window open")
     }
 
     private fun renderAutoLock() {
@@ -363,7 +499,7 @@ class MainActivity : Activity() {
         io.execute {
             try {
                 val s = CarApi.status(prefs, live)
-                runOnUiThread { car = s; carError = null; lastStatusAt = System.currentTimeMillis(); renderCar() }
+                runOnUiThread { car = s; carError = null; renderCar() }
             } catch (e: CarApi.Failure) {
                 runOnUiThread { if (car == null) carError = e.message; renderCar(); if (live) bar.show(e.message ?: "", Ui.CORAL) }
             } catch (e: Exception) {
@@ -377,20 +513,24 @@ class MainActivity : Activity() {
         loadStatus(live = true)
     }
 
-    /** Runs a car command off the main thread, showing progress on its tile. */
-    private fun runCommand(tile: Tile, doing: String, done: String, needsAdmin: Boolean, after: ((Boolean) -> Unit)? = null, call: () -> String) {
+    /**
+     * Runs a car command off the main thread. The button shows a ring while it runs, then flashes
+     * white when the car confirms (or shakes coral if it didn't), with a haptic tick either way.
+     */
+    private fun runCommand(control: Control, doing: String, done: String, needsAdmin: Boolean, after: ((Boolean) -> Unit)? = null, call: () -> String) {
         if (!prefs.configured) { bar.show("Set up the server in Settings first."); return }
         if (needsAdmin && !prefs.hasAdmin) { bar.show("This needs the admin token. Add it in Settings.", Ui.AMBER); return }
         if (busy) { bar.show("Wait for the current command to finish."); return }
         busy = true
-        tile.busy(doing)
+        control.view.performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK)
+        control.busy(doing)
         io.execute {
             val result = try { call(); null } catch (e: CarApi.Failure) { e.message } catch (e: Exception) { "Something went wrong: ${e.message}" }
             runOnUiThread {
                 busy = false
-                tile.busy(null)
-                if (result == null) bar.show(done, Ui.GLACIER) else bar.show(result, Ui.CORAL, 5_000)
                 after?.invoke(result == null)
+                control.done(result == null, done)
+                if (result != null) bar.show(result, Ui.CORAL, 5_000)
             }
         }
     }
@@ -456,7 +596,7 @@ class MainActivity : Activity() {
             addView(row(dp(10),
                 pillButton("Stop") {
                     d.dismiss()
-                    runCommand(climateTile, "Stopping…", "Climate off", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(climateOn = false); renderCar() } }) {
+                    runCommand(climateCard, "Stopping…", "Climate off", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(climateOn = false); renderCar() } }) {
                         CarApi.command(prefs, "POST", "/v1/climate/stop")
                     }
                 },
@@ -464,7 +604,7 @@ class MainActivity : Activity() {
                     d.dismiss()
                     prefs.climateTemp = temp.toFloat(); prefs.climateMinutes = minutes
                     val t = temp; val mins = minutes
-                    runCommand(climateTile, "Starting…", "Climate on: ${fmtTemp(t)} for $mins min", needsAdmin = true, after = { ok ->
+                    runCommand(climateCard, "Starting…", "Climate on: ${fmtTemp(t)} for $mins min", needsAdmin = true, after = { ok ->
                         if (ok) { car = car?.copy(climateOn = true, climateSetC = t); renderCar() }
                     }) {
                         CarApi.command(prefs, "POST", "/v1/climate/start", """{"temp":$t,"duration":$mins}""")
@@ -483,19 +623,62 @@ class MainActivity : Activity() {
             else -> "Not plugged in."
         }
         sheet("Charging", state) { d ->
+            // Charge limits (Cadillac-style target): 50–100 % in steps of 10, as the car accepts.
+            var ac = c?.chargeLimitAc ?: 80
+            var dc = c?.chargeLimitDc ?: 90
+            fun limitRow(name: String, get: () -> Int, set: (Int) -> Unit): View {
+                val value = text("${get()}%", 22f, Ui.TEXT, Ui.display).apply { gravity = Gravity.CENTER }
+                fun step(d: Int) { set((get() + d).coerceIn(50, 100)); value.text = "${get()}%" }
+                return LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(text(name, 15f, Ui.TEXT, Ui.medium), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    addView(pillButton("−") { step(-10) }.apply { textSize = 20f }, LinearLayout.LayoutParams(dp(52), dp(48)))
+                    addView(value, LinearLayout.LayoutParams(dp(76), ViewGroup.LayoutParams.WRAP_CONTENT))
+                    addView(pillButton("+") { step(10) }.apply { textSize = 20f }, LinearLayout.LayoutParams(dp(52), dp(48)))
+                }
+            }
+            addView(text("Charge limit", 14f, Ui.MUTED), Ui.lp(top = dp(18)))
+            addView(limitRow("Home charger (AC)", { ac }, { ac = it }), Ui.lp(top = dp(10)))
+            addView(limitRow("Fast charger (DC)", { dc }, { dc = it }), Ui.lp(top = dp(10)))
+            addView(pillButton("Save limits") {
+                d.dismiss()
+                val a = ac; val b = dc
+                runCommand(chargeCard, "Setting limits…", "Limits set", needsAdmin = true, after = { ok ->
+                    if (ok) { car = car?.copy(chargeLimitAc = a, chargeLimitDc = b); renderCar() }
+                }) { CarApi.command(prefs, "PUT", "/v1/charge-limit", """{"ac":$a,"dc":$b}""") }
+            }, Ui.lp(top = dp(14)))
             addView(row(dp(10),
                 pillButton("Stop charging") {
                     d.dismiss()
-                    runCommand(chargeTile, "Stopping…", "Charging stopped", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(charging = false); renderCar() } }) {
+                    runCommand(chargeCard, "Stopping…", "Charging stopped", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(charging = false); renderCar() } }) {
                         CarApi.command(prefs, "POST", "/v1/charge/stop")
                     }
                 },
                 pillButton("Start charging", Ui.GLACIER, Ui.ON_ACCENT) {
                     d.dismiss()
-                    runCommand(chargeTile, "Starting…", "Charging started", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(charging = true); renderCar() } }) {
+                    runCommand(chargeCard, "Starting…", "Charging started", needsAdmin = true, after = { ok -> if (ok) { car = car?.copy(charging = true); renderCar() } }) {
                         CarApi.command(prefs, "POST", "/v1/charge/start")
                     }
                 }), Ui.lp(top = dp(20)))
+        }
+    }
+
+    private fun vehicleSheet() {
+        val c = car ?: run { bar.show("No status yet. Tap Refresh."); return }
+        sheet("Vehicle status", c.updated?.let { fmtUpdated(it) }) { d ->
+            fun line(name: String, value: String, warn: Boolean = false) = addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                addView(text(name, 15f, Ui.MUTED), LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(text(value, 15f, if (warn) Ui.AMBER else Ui.TEXT, Ui.medium))
+            }, Ui.lp(top = dp(14)))
+            line("Tire pressure", if (c.tireWarning) "Low" else "Normal", c.tireWarning)
+            line("12 V battery", c.aux12v?.let { "$it%" } ?: "–", (c.aux12v ?: 100) < 60)
+            line("Washer fluid", if (c.washerLow) "Low" else "OK", c.washerLow)
+            line("Doors, trunk, frunk", if (c.open.isEmpty()) "Closed" else c.open.joinToString(", "), c.open.isNotEmpty())
+            line("Windows", if (c.windowsOpen) "Open" else "Closed", c.windowsOpen)
+            line("Odometer", c.odometerKm?.let { String.format(java.util.Locale.CANADA, "%,d km", it) } ?: "–")
+            addView(pillButton("Done") { d.dismiss() }, Ui.lp(top = dp(22)))
         }
     }
 
@@ -504,12 +687,13 @@ class MainActivity : Activity() {
         if (!prefs.hasAdmin) { bar.show("Finding the car needs the admin token. Add it in Settings.", Ui.AMBER); return }
         if (busy) { bar.show("Wait for the current command to finish."); return }
         busy = true
-        findTile.busy("Locating…")
+        findCard.busy("Locating…")
         io.execute {
             val res = try { Result.success(CarApi.location(prefs)) } catch (e: Exception) { Result.failure(e) }
             runOnUiThread {
                 busy = false
-                findTile.busy(null)
+                findCard.done(res.isSuccess, null)
+                findCard.detail("Opens where the car is in Maps")
                 res.onSuccess { (lat, lon) ->
                     try {
                         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:$lat,$lon?q=$lat,$lon(My car)")))
