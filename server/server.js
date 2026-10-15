@@ -36,7 +36,10 @@ const CFG = {
   pollMs: num(env.BLUELINK_POLL_MS, 5000),
   minCooldownSec: num(env.BLUELINK_MIN_COOLDOWN_SECONDS, 600),
   loginRetrySec: num(env.BLUELINK_LOGIN_RETRY_SECONDS, 300),
-  statusCacheSec: num(env.STATUS_CACHE_SECONDS, 300),   // app opens within this share one Hyundai read
+  // App opens within this share one read of Hyundai's saved copy. Hyundai's sign-ins only last
+  // ~20–30 min, so a read after that usually means a fresh sign-in; lock state and driving/parked
+  // come from the phone now, so battery/range being up to 30 min old is fine.
+  statusCacheSec: num(env.STATUS_CACHE_SECONDS, 1800),
   // Waking the car (live status, commands, location) is what Hyundai limits per day. Automatic
   // live refreshes follow the community tools' practice: rarely, within a daily budget, never at night.
   wake: {
@@ -162,6 +165,7 @@ const bl = new BlueLinkCA({
   debug: env.IONIQ6_DEBUG ? (m) => log('[debug]', m) : null,
   warn: (m) => log('[bluelink]', m),
   onCall: logCall,
+  onNote: (text) => fs.appendFile(CALL_LOG, `${new Date().toISOString()} # ${text}\n`, { mode: 0o600 }, () => {}),
 });
 
 // Hyundai doesn't like concurrent sessions/commands from one device: run one operation at a time.

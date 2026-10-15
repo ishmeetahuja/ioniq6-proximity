@@ -290,7 +290,7 @@ doctor() {
   fi
 
   say "Hyundai"
-  local auth until calls since last
+  local auth until calls since last notes
   auth=$(api GET /v1/auth 2>/dev/null || true)
   if echo "$auth" | grep -q '"loggedIn": true'; then pass "signed in to BlueLink"
   else fail "not signed in to BlueLink right now (it signs in again by itself; if this stays, run: bash install.sh login)"; fi
@@ -303,10 +303,15 @@ doctor() {
   if [ -n "$calls" ]; then
     since=$(date -u -d '-24 hours' +%FT%T 2>/dev/null || echo 0)
     echo "  Requests to Hyundai in the last 24 h (endpoint, count):"
-    echo "$calls" | awk -v s="$since" '$1 >= s { n[$2]++; if ($3 == 429) r[$2]++ }
+    echo "$calls" | awk -v s="$since" '$1 >= s && $2 != "#" { n[$2]++; if ($3 == 429) r[$2]++ }
       END { for (e in n) printf "        %-26s %4d%s\n", e, n[e], (r[e] ? "   (" r[e] " refused: rate limit)" : "") }' | sort -k2 -nr
     last=$(echo "$calls" | awk '$3 == 429 { t = $1 } END { print t }')
     [ -n "$last" ] && echo "  last rate limit: $(date -d "$last" '+%b %-d, %-I:%M %p' 2>/dev/null || echo "$last")"
+    notes=$(echo "$calls" | awk '$2 == "#"' | tail -4)
+    if [ -n "$notes" ]; then
+      echo "  How long Hyundai's sign-ins last (latest):"
+      echo "$notes" | while read -r t _ rest; do echo "        $(date -d "$t" '+%-I:%M %p' 2>/dev/null || echo "$t")  $rest"; done
+    fi
   else
     echo "  (no record of Hyundai requests yet; it starts with this version)"
   fi
@@ -366,11 +371,17 @@ if [ -f .env ]; then
   docker compose up -d
   wait_healthy
   install_watchdog
-  if api GET /v1/auth | grep -q '"loggedIn": false'; then
-    echo "Not signed in to BlueLink yet — finishing that now."
+  # Don't sign in here: every sign-in counts against Hyundai's limit, and the server signs in by
+  # itself the next time it needs Hyundai. Only an unfinished email verification needs us.
+  auth=$(api GET /v1/auth || true)
+  if echo "$auth" | grep -q '"otpPending": true'; then
+    echo "Hyundai's email verification isn't finished yet — finishing that now."
     do_login
+  elif echo "$auth" | grep -q '"loggedIn": true'; then
+    echo "Updated. Signed in to BlueLink."
   else
-    echo "Updated and signed in to BlueLink."
+    echo "Updated. The server signs in to BlueLink by itself the next time it needs to"
+    echo "(each sign-in counts against Hyundai's limit, so it doesn't do one now)."
   fi
   show_details
   exit 0

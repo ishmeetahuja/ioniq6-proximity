@@ -65,7 +65,7 @@ class BlueLinkCA {
    * @param {(msg)=>void} [o.debug]
    * @param {number} [o.pollMs]        delay between action-status polls (default 5000)
    */
-  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs, minCooldownSec, loginRetrySec, onCall } = {}) {
+  constructor({ creds, session, saveSession, baseUrl, debug, warn, pollMs, minCooldownSec, loginRetrySec, onCall, onNote } = {}) {
     if (!creds?.username || !creds?.password || !creds?.pin) {
       throw new BlueLinkError('BlueLink username, password and PIN are all required.', 'INPUT');
     }
@@ -78,6 +78,7 @@ class BlueLinkCA {
     this.warn = warn || ((m) => console.warn(`[bluelink] ${m}`));
     this.pollMs = pollMs || 5000;
     this.onCall = onCall || null;   // (endpoint, httpStatus | 'network', errorCode) after every request
+    this.onNote = onNote || null;   // (text) for facts worth keeping, e.g. how long sign-ins last
     // Back-off: Hyundai sits behind Cloudflare, which bans an IP that keeps knocking.
     this.minCooldownMs = (minCooldownSec ?? 600) * 1000;   // after a 429, stay away at least this long
     this.loginRetryMs = (loginRetrySec ?? 300) * 1000;     // after a failed sign-in, wait before the next
@@ -314,6 +315,7 @@ class BlueLinkCA {
     delete this.session.loginRefusals;
     this.save();
     this.warn(`signed in; Hyundai says this sign-in lasts ${Math.round(Number(tok.expireIn) / 60)} min`);
+    try { this.onNote?.(`sign-in lasts ${Math.round(Number(tok.expireIn) / 60)}min`); } catch {}
   }
 
   /** We hold a session token. (Whether Hyundai still accepts it is only known by using it.) */
@@ -364,6 +366,7 @@ class BlueLinkCA {
     if (res.json.responseHeader?.responseCode === 1 && AUTH_ERRORS.has(String(res.json.error?.errorCode))) {
       const age = this.session.signedInAt ? Math.round((Date.now() - this.session.signedInAt) / 60000) : null;
       this.warn(`Hyundai ended the sign-in (${res.json.error?.errorCode})${age !== null ? ` after ${age} min` : ''}; signing in again`);
+      try { this.onNote?.(`sign-in ended after ${age ?? '?'}min (${endpoint})`); } catch {}
       await this.relogin();
       res = await go();
     }

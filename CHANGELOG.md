@@ -10,6 +10,29 @@ different, in plain words, with an example. Newest first.
 
 ---
 
+## Build 32 — Oct 15, 2026 · server
+
+**Fewer sign-ins to Hyundai.** Today's count was 14 sign-in attempts, 9 refused. Here's where
+they came from and what changed:
+
+- **Updating the server signed in every time.** Example: each `bash install.sh` today tried a
+  sign-in, and several were refused. Now an update never signs in (unless Hyundai's email
+  verification is unfinished). The server signs in by itself the next time it actually needs
+  Hyundai.
+- **Opening the app** read Hyundai's saved data at most every 5 minutes, shared across opens.
+  Hyundai's sign-ins only last about 20–30 minutes, so that read usually meant a new sign-in.
+  Now the server shares one read for **30 minutes**. Locked/unlocked and driving/parked come from
+  your phone anyway, so battery and range being up to 30 minutes old is fine. Refresh still asks
+  the car right away.
+- **Locks still sign in when they have to**, because nothing is more important than the lock.
+- **`doctor` now shows how long Hyundai's sign-ins actually last**, e.g.
+  "sign-in lasts 30min" and "sign-in ended after 19min", kept across updates. After a day of
+  this we'll know whether there's more to cut.
+
+**Update:** server.
+
+---
+
 ## Build 31 — Oct 15, 2026 · app
 
 **At home, only the 20-second rule locks the car.**
